@@ -55,7 +55,7 @@ class BaseConfigDownload:
 
 @dataclass
 class DownloadConfigHLS(BaseConfigDownload):
-    m3u8_base_url: Any = None
+    media_source: Any = None
     remux: bool = False
     start_segment: int = 0
     segment_state_path: str | None = None

@@ -76,3 +76,10 @@ from base_api.base import (
     media_field,
 )
 from base_api.modules.config import config, DownloadConfigHLS, DownloadConfigRAW
+
+from .direct_adapter import DirectMediaAdapter
+
+
+from .provider import MediaProvider
+from .registry import ProviderRegistry
+

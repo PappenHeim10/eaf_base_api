@@ -2240,8 +2240,15 @@ class BaseCore:
 
         return available_qualities(collect_variants(master))
 
-    async def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> List[str]:
+    async def get_segments(self, source: Any, quality: Union[str, int]) -> List[str]:
         assert m3u8 is not None
+        
+        if getattr(source, "source_type", None) != "HLS":
+            from base_api.modules.errors import UnsupportedProtocolError
+            raise UnsupportedProtocolError(f"Unsupported source type: {getattr(source, 'source_type', 'None')}")
+            
+        m3u8_url_master = getattr(source, "url", "")
+        
         segment_cache_key = SegmentCacheKey(m3u8_url_master, str(quality))
         _segments = self.cache.get_segments(segment_cache_key)
         if _segments is not None:
@@ -2356,7 +2363,16 @@ class BaseCore:
             configuration.callback = Callback.text_progress_bar
             self.logger.debug("download: no callback provided, using default text progress bar")
 
-        m3u8_url = configuration.m3u8_base_url
+        media_source = configuration.media_source
+        if media_source is None:
+            from base_api.modules.errors import MediaSourceError
+            raise MediaSourceError("No media source provided.")
+            
+        if getattr(media_source, "source_type", None) != "HLS":
+            from base_api.modules.errors import UnsupportedProtocolError
+            raise UnsupportedProtocolError(f"Unsupported source type: {getattr(media_source, 'source_type', 'None')}")
+
+        m3u8_url = getattr(media_source, "url", "")
 
         if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
             m3u8_url = m3u8_url()
@@ -2364,7 +2380,7 @@ class BaseCore:
             m3u8_url = await m3u8_url
 
         if m3u8_url:
-            self.logger.debug("Download m3u8_base_url=%s", m3u8_url)
+            self.logger.debug("Download media_source.url=%s", m3u8_url)
 
         self.logger.debug("download: dispatching to threaded downloader (timeout=%s)", self.configuration.timeout)
 
@@ -2470,8 +2486,14 @@ class BaseCore:
 
             else:
                 m3u8_master = pre_resolved_m3u8_url
-                self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
-                segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
+                self.logger.info(f"Fetching segments for quality={quality} media_source.url={m3u8_master}")
+                
+                # Mocking a source temporarily for threaded_download compatibility with get_segments
+                class _TempSource:
+                    source_type = "HLS"
+                    url = m3u8_master
+                
+                segments = await self.get_segments(quality=quality, source=_TempSource())
                 total_before = len(segments)
                 if start_segment > 0:
                     self.logger.debug(
@@ -2606,11 +2628,15 @@ class BaseCore:
                         )
                         for i in target_indices
                     }
-                    stop_waiter = (
-                        asyncio.create_task(stop_event.wait(), name="hls-stop-waiter")
-                        if stop_event is not None
-                        else None
-                    )
+                    if stop_event is not None:
+                        if hasattr(stop_event, "is_set") and not asyncio.iscoroutinefunction(getattr(stop_event, "wait", None)):
+                            # Handle threading.Event by offloading to thread
+                            stop_waiter = asyncio.create_task(asyncio.to_thread(stop_event.wait), name="hls-stop-waiter")
+                        else:
+                            # Handle asyncio.Event natively
+                            stop_waiter = asyncio.create_task(stop_event.wait(), name="hls-stop-waiter")
+                    else:
+                        stop_waiter = None
 
                     while segment_tasks:
                         waiters = set(segment_tasks)

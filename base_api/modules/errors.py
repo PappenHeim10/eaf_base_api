@@ -344,3 +344,21 @@ class StateLoadError(BaseScraperError):
 
 class MaxRetriesExceeded(BaseScraperError):
     pass
+
+class MediaSourceError(Exception):
+    pass
+
+class UnsupportedProtocolError(Exception):
+    pass
+
+
+class UnsupportedURLError(Exception):
+    pass
+
+class UnsupportedMediaTypeError(Exception):
+    pass
+
+
+class AmbiguousProviderError(Exception):
+    pass
+
