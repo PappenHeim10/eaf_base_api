@@ -2904,6 +2904,67 @@ class BaseCore:
             self.logger.exception(f"Unhandled exception in download wrapper: {e}")
             return False
 
+    # A download that finished every segment must not be thrown away because our
+    # own process still holds the assembled file open. Windows refuses to move an
+    # open file, so closure is deterministic and the move is retried briefly.
+    _RENAME_RETRY_ATTEMPTS = 4
+    _RENAME_RETRY_INITIAL_DELAY = 0.05
+
+    @staticmethod
+    def _describe_path(path: str) -> str:
+        """Metadata about a file, never its contents."""
+        try:
+            return f"exists size={os.path.getsize(path)}"
+        except OSError:
+            return "missing"
+
+    def _replace_with_retry(self, source: str, target: str) -> None:
+        """Move `source` onto `target`, tolerating a brief sharing violation.
+
+        Every handle this process owns is closed before this runs. Windows can
+        still hold a file for a moment afterwards - a scanner, the indexer, or the
+        filesystem itself - and that window is short. Only WinError 32 is retried;
+        any other PermissionError means something is genuinely wrong and must not
+        be papered over by waiting.
+
+        os.replace rather than os.rename: rename refuses to overwrite an existing
+        target on Windows, which turns a re-download into a spurious failure.
+        """
+        delay = self._RENAME_RETRY_INITIAL_DELAY
+        for attempt in range(1, self._RENAME_RETRY_ATTEMPTS + 1):
+            try:
+                os.replace(source, target)
+                return
+            except PermissionError as error:
+                if getattr(error, "winerror", None) != 32:
+                    raise
+                if attempt >= self._RENAME_RETRY_ATTEMPTS:
+                    self.logger.error(
+                        "Final rename blocked by WinError 32 after %s attempts; giving up. tmp=[%s] target=[%s]",
+                        attempt,
+                        self._describe_path(source),
+                        self._describe_path(target),
+                    )
+                    raise
+                self.logger.warning(
+                    "Final rename blocked by WinError 32; retry %s/%s after %.0f ms",
+                    attempt + 1,
+                    self._RENAME_RETRY_ATTEMPTS,
+                    delay * 1000,
+                )
+                time.sleep(delay)
+                delay *= 2
+
+    def _close_quietly(self, container: Any, role: str) -> None:
+        if container is None:
+            return
+        try:
+            container.close()
+        except Exception as exc:
+            # Never let a failure to close replace the error we are actually
+            # reporting - but do not hide it either.
+            self.logger.debug("Closing %s container failed: %s", role, exc)
+
     def _convert_ts_to_mp4(self, input_path: str, output_path: str,
                            callback: Callable[[int, int], None] | None = None, ios_support: bool = False) -> None:
         start_ts = time.perf_counter()
@@ -2926,154 +2987,168 @@ class BaseCore:
 
         self.logger.debug("Opening input for remux: %s", input_path)
         input_ = av_open(input_path)
-        fmt_name = (input_.format.name or "").lower()
-        self.logger.info("Input format detected: %s", fmt_name or '<unknown>')
+        output = None
+        pass_through = False
 
-        if fmt_name == "mpegts":
-            # Fix 1: Suppress the stub mismatch for av.open
-            output = av_open(output_path, mode="w", format="mp4",
-                             options={"movflags": "faststart"})  # type: ignore[arg-type]
+        try:
+            fmt_name = (input_.format.name or "").lower()
+            self.logger.info("Input format detected: %s", fmt_name or '<unknown>')
 
-            # --- VIDEO ---
-            in_video = input_.streams.video[0]
-            out_video = output.add_stream_from_template(template=in_video)
-            self.logger.debug(
-                "Video stream: codec=%s bit_rate=%s",
-                getattr(in_video.codec_context, 'name', None), getattr(in_video.codec_context, 'bit_rate', None)
-            )
+            if fmt_name == "mpegts":
+                # Fix 1: Suppress the stub mismatch for av.open
+                output = av_open(output_path, mode="w", format="mp4",
+                                 options={"movflags": "faststart"})  # type: ignore[arg-type]
 
-            # --- AUDIO ---
-            in_audio = next((s for s in input_.streams if s.type == "audio"), None)
-            out_audio = None
-            transcode_audio = False
-            resampler = None
-
-            if in_audio:
-                # Fix 3: Explicitly narrow out None
-                assert in_audio is not None
-
-                # Fix 2: Cast context to AudioCodecContext so IDE knows about sample_rate and layout
-                audio_ctx = cast('AudioCodecContext', in_audio.codec_context)
-
-                copy_ok = {"aac"} if ios_support else {"aac", "alac", "mp3"}
-                codec_name = (audio_ctx.name or "").lower()
-                sample_rate = audio_ctx.sample_rate or 0
-                layout_name = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "unknown"
-
+                # --- VIDEO ---
+                in_video = input_.streams.video[0]
+                out_video = output.add_stream_from_template(template=in_video)
                 self.logger.debug(
-                    "Audio stream: codec=%s sample_rate=%s layout=%s", codec_name, sample_rate, layout_name
+                    "Video stream: codec=%s bit_rate=%s",
+                    getattr(in_video.codec_context, 'name', None), getattr(in_video.codec_context, 'bit_rate', None)
                 )
 
-                if codec_name in copy_ok:
-                    out_audio = output.add_stream_from_template(template=in_audio)
-                    self.logger.info("Audio codec MP4-compatible; remuxing without transcoding.")
-                else:
-                    transcode_audio = True
-                    sample_rate = audio_ctx.sample_rate or 48000
-                    layout = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "stereo"
+                # --- AUDIO ---
+                in_audio = next((s for s in input_.streams if s.type == "audio"), None)
+                out_audio = None
+                transcode_audio = False
+                resampler = None
 
-                    out_audio = output.add_stream("aac", rate=sample_rate)
-                    self.logger.info("Transcoding audio to AAC: sample_rate=%s layout=%s"), sample_rate, layout
+                if in_audio:
+                    # Fix 3: Explicitly narrow out None
+                    assert in_audio is not None
 
-                    try:
-                        out_audio.layout = layout
-                    except Exception as exc:
-                        self.logger.warning("Exception in getting audio layout (doesn't matter): %s", exc)
-                        pass
+                    # Fix 2: Cast context to AudioCodecContext so IDE knows about sample_rate and layout
+                    audio_ctx = cast('AudioCodecContext', in_audio.codec_context)
 
-                    resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
-            else:
-                self.logger.info("No audio stream detected; remuxing video only.")
+                    copy_ok = {"aac"} if ios_support else {"aac", "alac", "mp3"}
+                    codec_name = (audio_ctx.name or "").lower()
+                    sample_rate = audio_ctx.sample_rate or 0
+                    layout_name = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "unknown"
 
-            # --- DEMUX ---
-            demux_streams = [in_video] + ([in_audio] if in_audio else [])
-            packets = input_.demux(demux_streams)
-
-            try:
-                total = os.path.getsize(input_path)
-            except Exception as exc:
-                self.logger.warning("Exception while getting path size for demuxing progress??? %s", exc)
-                total = 100
-
-            self.logger.info("Demuxing packets: total_bytes=%s", total)
-            progress_step = max(1, total // 10) if total else 0
-            next_progress_log = progress_step if progress_step else 0
-            current_progress = 0
-            timestamp_offsets: dict[int, int] = {}
-            last_dts: dict[int, int] = {}
-            last_durations: dict[int, int] = {}
-
-            for idx, packet in enumerate(packets):
-                pkt_size = getattr(packet, "size", 0) or 0
-                current_progress += pkt_size
-
-                if packet.dts is None:
-                    if callback:
-                        callback(current_progress, total)
-                    continue
-
-                timestamp_correction = _normalize_packet_timestamps(
-                    packet,
-                    timestamp_offsets,
-                    last_dts,
-                    last_durations,
-                )
-                if timestamp_correction:
-                    self.logger.info(
-                        "Normalized HLS timestamp discontinuity: stream=%s correction=%s time_base=%s",
-                        packet.stream.index,
-                        timestamp_correction,
-                        packet.time_base,
+                    self.logger.debug(
+                        "Audio stream: codec=%s sample_rate=%s layout=%s", codec_name, sample_rate, layout_name
                     )
 
-                if packet.stream == in_video:
-                    packet.stream = out_video
-                    output.mux(packet)
-
-                elif in_audio and packet.stream == in_audio:
-                    if not transcode_audio:
-                        packet.stream = out_audio
-                        output.mux(packet)
+                    if codec_name in copy_ok:
+                        out_audio = output.add_stream_from_template(template=in_audio)
+                        self.logger.info("Audio codec MP4-compatible; remuxing without transcoding.")
                     else:
-                        assert out_audio is not None
-                        for frame in packet.decode():
-                            # Fix 4: Ensure the frame is recognized as an AudioFrame
-                            if not isinstance(frame, av.audio.frame.AudioFrame):
-                                continue
+                        transcode_audio = True
+                        sample_rate = audio_ctx.sample_rate or 48000
+                        layout = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "stereo"
 
-                            frames = resampler.resample(frame) if resampler else [frame]
-                            for f in frames:
-                                for enc_pkt in out_audio.encode(f):
-                                    output.mux(enc_pkt)
+                        out_audio = output.add_stream("aac", rate=sample_rate)
+                        self.logger.info("Transcoding audio to AAC: sample_rate=%s layout=%s", sample_rate, layout)
 
-                if callback:
-                    callback(current_progress, total)
-                if progress_step and current_progress >= next_progress_log:
-                    self.logger.debug("Remux progress: bytes=%s/%s", current_progress, total)
-                    next_progress_log += progress_step
+                        try:
+                            out_audio.layout = layout
+                        except Exception as exc:
+                            self.logger.warning("Exception in getting audio layout (doesn't matter): %s", exc)
 
-            if transcode_audio and out_audio:
-                self.logger.debug("Flushing AAC encoder.")
-                for enc_pkt in out_audio.encode(None):
-                    output.mux(enc_pkt)
+                        resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+                else:
+                    self.logger.info("No audio stream detected; remuxing video only.")
 
-            input_.close()
-            output.close()
+                # --- DEMUX ---
+                demux_streams = [in_video] + ([in_audio] if in_audio else [])
+                packets = input_.demux(demux_streams)
+
+                try:
+                    total = os.path.getsize(input_path)
+                except Exception as exc:
+                    self.logger.warning("Exception while getting path size for demuxing progress??? %s", exc)
+                    total = 100
+
+                self.logger.info("Demuxing packets: total_bytes=%s", total)
+                progress_step = max(1, total // 10) if total else 0
+                next_progress_log = progress_step if progress_step else 0
+                current_progress = 0
+                timestamp_offsets: dict[int, int] = {}
+                last_dts: dict[int, int] = {}
+                last_durations: dict[int, int] = {}
+
+                for idx, packet in enumerate(packets):
+                    pkt_size = getattr(packet, "size", 0) or 0
+                    current_progress += pkt_size
+
+                    if packet.dts is None:
+                        if callback:
+                            callback(current_progress, total)
+                        continue
+
+                    timestamp_correction = _normalize_packet_timestamps(
+                        packet,
+                        timestamp_offsets,
+                        last_dts,
+                        last_durations,
+                    )
+                    if timestamp_correction:
+                        self.logger.info(
+                            "Normalized HLS timestamp discontinuity: stream=%s correction=%s time_base=%s",
+                            packet.stream.index,
+                            timestamp_correction,
+                            packet.time_base,
+                        )
+
+                    if packet.stream == in_video:
+                        packet.stream = out_video
+                        output.mux(packet)
+
+                    elif in_audio and packet.stream == in_audio:
+                        if not transcode_audio:
+                            packet.stream = out_audio
+                            output.mux(packet)
+                        else:
+                            assert out_audio is not None
+                            for frame in packet.decode():
+                                # Fix 4: Ensure the frame is recognized as an AudioFrame
+                                if not isinstance(frame, av.audio.frame.AudioFrame):
+                                    continue
+
+                                frames = resampler.resample(frame) if resampler else [frame]
+                                for f in frames:
+                                    for enc_pkt in out_audio.encode(f):
+                                        output.mux(enc_pkt)
+
+                    if callback:
+                        callback(current_progress, total)
+                    if progress_step and current_progress >= next_progress_log:
+                        self.logger.debug("Remux progress: bytes=%s/%s", current_progress, total)
+                        next_progress_log += progress_step
+
+                if transcode_audio and out_audio:
+                    self.logger.debug("Flushing AAC encoder.")
+                    for enc_pkt in out_audio.encode(None):
+                        output.mux(enc_pkt)
+
+            else:
+                # Already MP4 - typically fragmented-MP4 HLS. Nothing to remux, the
+                # assembled file only has to be moved into place. The move happens
+                # after the finally below, because PyAV still has this very file
+                # open right now and Windows will not move an open file.
+                self.logger.info("Stream seems to be already in MP4! Skipping remux...")
+                pass_through = True
+
+        finally:
+            # Deterministic, and in this order: the writer first, then the reader.
+            # Relying on garbage collection here is what produced WinError 32.
+            self._close_quietly(output, "output")
+            self._close_quietly(input_, "input")
+
+        if pass_through:
+            self._replace_with_retry(input_path, output_path)
             elapsed = time.perf_counter() - start_ts
+            self.logger.info("Remux skipped; file moved. elapsed=%.2fs", elapsed)
+            return
 
-            try:
-                out_size = os.path.getsize(output_path)
-                self.logger.info("Remux complete: output=%s size=%s bytes elapsed=%s.2f", output_path, out_size,
-                                 elapsed)
-            except Exception as e:
-                self.logger.info("Remux complete: output=%s elapsed=%s.2fs (size unavailable: %s)", output_path,
-                                 elapsed, e)
-
-        else:
-            self.logger.info("Stream seems to be already in MP4! Skipping remux...")
-            os.rename(input_path, output_path)
-            elapsed = time.perf_counter() - start_ts
-            self.logger.info("Remux skipped; file moved. elapsed=%s.2f", elapsed)
+        elapsed = time.perf_counter() - start_ts
+        try:
+            out_size = os.path.getsize(output_path)
+            self.logger.info("Remux complete: output=%s size=%s bytes elapsed=%.2fs", output_path, out_size,
+                             elapsed)
+        except Exception as e:
+            self.logger.info("Remux complete: output=%s elapsed=%.2fs (size unavailable: %s)", output_path,
+                             elapsed, e)
 
     async def legacy_download(self, url: str, configuration: DownloadConfigRAW) -> bool:
         """
