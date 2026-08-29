@@ -18,7 +18,9 @@ class DownloadState:
     start_segment: int
     total: int
     missing: list[int]
-    segments: list[str]
+    # Version 1: plain URL strings. Version 2 (byte-range playlists): dicts of
+    # url plus, for ranged entries, length and offset.
+    segments: list[Any]
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)

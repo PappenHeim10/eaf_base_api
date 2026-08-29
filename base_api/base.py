@@ -39,6 +39,7 @@ from base_api.modules.static_functions import (
     choose_variant, collect_variants, get_segment_index_width
 )
 from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig
+from base_api.models import HLSSegment
 from base_api.modules.progress_bars import Callback
 from base_api.modules.logger import configure_app_logging
 
@@ -2251,7 +2252,26 @@ class BaseCore:
 
         return available_qualities(collect_variants(master))
 
-    async def get_segments(self, source: Any, quality: Union[str, int]) -> List[str]:
+    @staticmethod
+    def _parse_byterange(value: Any) -> tuple[int, int | None]:
+        """Parse an HLS BYTERANGE value: "<length>[@<offset>]".
+
+        Returns (length, offset); offset is None when the playlist omitted it,
+        which means "continues the previous sub-range" for media segments and
+        "start of the resource" for an EXT-X-MAP.
+        """
+        text = str(value).strip()
+        length_part, sep, offset_part = text.partition("@")
+        try:
+            length = int(length_part)
+            offset = int(offset_part) if sep else None
+        except ValueError as error:
+            raise PlaylistExtractionError(f"Invalid BYTERANGE value: {value!r}") from error
+        if length <= 0 or (offset is not None and offset < 0):
+            raise PlaylistExtractionError(f"Invalid BYTERANGE value: {value!r}")
+        return length, offset
+
+    async def get_segments(self, source: Any, quality: Union[str, int]) -> List[Any]:
         assert m3u8 is not None
         
         if getattr(source, "source_type", None) != "HLS":
@@ -2296,16 +2316,18 @@ class BaseCore:
             parsed = m3u8.loads(content)
             base_url = media_url
 
-        segments: List[str] = []
+        specs: List[HLSSegment] = []
 
         # Robust init segment handling (EXT-X-MAP)
         # Older m3u8 lib: .segment_map; newer: .init_section
         init_url = None
+        init_byterange = None
         segments_map = getattr(parsed, "segment_map", None)
         if segments_map:
             assert isinstance(segments_map, list)
             try:
                 init_url = urljoin(base_url, segments_map[0].uri)
+                init_byterange = getattr(segments_map[0], "byterange", None)
             except Exception as exc:
                 self.logger.info("Couldn't get init url, this is probably not an issue: %s", exc)
                 pass
@@ -2313,19 +2335,54 @@ class BaseCore:
             init_section = getattr(parsed, "init_section", None)
             if init_section and getattr(init_section, "uri", None):
                 init_url = urljoin(base_url, init_section.uri)
+                init_byterange = getattr(init_section, "byterange", None)
 
         if init_url:
-            segments.append(init_url)
+            if init_byterange:
+                # RFC 8216 4.3.2.5: an EXT-X-MAP BYTERANGE without @offset
+                # starts at the beginning of the resource.
+                length, offset = self._parse_byterange(init_byterange)
+                specs.append(HLSSegment(url=init_url, length=length, offset=offset or 0))
+            else:
+                specs.append(HLSSegment(url=init_url))
             self.logger.debug("Found init segment: %s", init_url)
 
-        # Build absolute URLs for all media segments
+        # Build absolute URLs for all media segments, carrying byte ranges.
+        # RFC 8216 4.3.2.2: EXT-X-BYTERANGE without @offset continues directly
+        # after the previous media segment's sub-range of the same resource;
+        # without such a predecessor the playlist is invalid.
+        next_offset: Dict[str, int] = {}
         for seg in parsed.segments:
-            segments.append(urljoin(base_url, seg.uri))
+            seg_url = urljoin(base_url, seg.uri)
+            byterange = getattr(seg, "byterange", None)
+            if byterange:
+                length, offset = self._parse_byterange(byterange)
+                if offset is None:
+                    if seg_url not in next_offset:
+                        raise PlaylistExtractionError(
+                            f"EXT-X-BYTERANGE without offset has no preceding sub-range of {seg_url}"
+                        )
+                    offset = next_offset[seg_url]
+                specs.append(HLSSegment(url=seg_url, length=length, offset=offset))
+                next_offset[seg_url] = offset + length
+            else:
+                specs.append(HLSSegment(url=seg_url))
 
-        self.logger.debug("Fetched %s segments from m3u8 URL (including init if present)", len(segments))
+        ranged = any(spec.has_range for spec in specs)
+        self.logger.debug(
+            "Fetched %s segments from m3u8 URL (including init if present, byte-ranged=%s)",
+            len(specs), ranged,
+        )
+        if ranged:
+            # Ranged playlists are not cached: the segment cache stores plain
+            # URL strings, and a range dropped on the way through it would turn
+            # every fragment back into a full-file download.
+            return cast(List[Any], specs)
+
+        segments = [spec.url for spec in specs]
         self.logger.info("Saving segments to cache....")
         self.cache.set_segments(segment_cache_key, segments)
-        return segments
+        return cast(List[Any], segments)
 
 
     def _safe_remove(self, path: str | None) -> None:
@@ -2350,16 +2407,44 @@ class BaseCore:
 
     async def download_segment(self, url: str, timeout: int, stop_event:
                                 asyncio.Event | None = None,
-                                headers: Dict[str, str] | None = None) -> tuple[str, bytes, bool]:
+                                headers: Dict[str, str] | None = None,
+                                byte_range: tuple[int, int] | None = None) -> tuple[str, bytes, bool]:
         """
-        Attempt to download a single segment.
+        Attempt to download a single segment, optionally a byte range of it.
+
+        `byte_range` is (offset, length) from the playlist and becomes the
+        request's `Range: bytes=<offset>-<offset+length-1>`. The header is
+        request-local: it is merged with the source's own headers into a fresh
+        dict, never written back into them, and never onto the session. The
+        playlist-computed range wins over any Range a caller put into the
+        source headers - the playlist is the contract for what this segment is.
         Returns (url, content, success).
         """
         try:
             if stop_event is not None and stop_event.is_set():
                 return url, b"", False # Stopping the download here
 
-            content = await self.fetch_bytes(url, timeout=timeout, headers=headers)
+            request_headers: Dict[str, str] | None = headers
+            if byte_range is not None:
+                offset, length = byte_range
+                request_headers = {
+                    key: value for key, value in (headers or {}).items()
+                    if key.lower() != "range"
+                }
+                request_headers["Range"] = f"bytes={offset}-{offset + length - 1}"
+
+            content = await self.fetch_bytes(url, timeout=timeout, headers=request_headers)
+
+            if byte_range is not None and len(content) != byte_range[1]:
+                # A server that ignores Range answers 200 with the whole
+                # resource; concatenating that once per fragment would corrupt
+                # the output. Wrong-sized payloads are failures, not data.
+                self.logger.warning(
+                    "Range request for %s returned %s bytes instead of %s (%s)",
+                    url, len(content), byte_range[1], request_headers.get("Range") if request_headers else None,
+                )
+                return url, b"", False
+
             return url, content, True
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.
@@ -2480,6 +2565,26 @@ class BaseCore:
 
             if resume_mode:
                 assert resume_state is not None
+                loaded_segments = resume_state.get("segments") or []
+                if (
+                    int(resume_state.get("version") or 1) < 2
+                    and loaded_segments
+                    and all(isinstance(entry, str) for entry in loaded_segments)
+                    and len(set(loaded_segments)) < len(loaded_segments)
+                ):
+                    # A version-1 state cannot express byte ranges, so duplicate
+                    # URLs in one mean it was written for a byte-range playlist
+                    # by an engine without range support. Resuming it would
+                    # fetch the full resource once per fragment - start fresh.
+                    self.logger.warning(
+                        "Segment state %s predates byte-range support and repeats URLs; discarding it and starting fresh.",
+                        segment_state_path,
+                    )
+                    resume_mode = False
+                    resume_state = None
+
+            if resume_mode:
+                assert resume_state is not None
                 segments = resume_state.get("segments") or []  # This fetches the list of segments from the resume state
                 if not segments:
                     raise UnknownError("Segment state is invalid or empty.") # Shouldn't happen ;)
@@ -2542,7 +2647,42 @@ class BaseCore:
                     f"segment_index_width={width} m3u8_url={m3u8_url}"
                 )
 
-            n = len(segments) # Total amount of segments
+            # One internal representation for both worlds: plain URLs (str),
+            # parsed playlist entries (HLSSegment) and resumed state entries
+            # (JSON dicts) all become HLSSegment before anything downloads.
+            def _as_spec(entry: Any) -> HLSSegment:
+                if isinstance(entry, HLSSegment):
+                    return entry
+                if isinstance(entry, Mapping):
+                    return HLSSegment(
+                        url=str(entry.get("url", "")),
+                        length=entry.get("length"),
+                        offset=entry.get("offset"),
+                    )
+                return HLSSegment(url=str(entry))
+
+            segment_specs = [_as_spec(entry) for entry in segments]
+            ranged_mode = any(spec.has_range for spec in segment_specs)
+            # What the state file stores. Version 1 keeps the plain-string
+            # layout every existing state uses; ranged playlists persist
+            # url+range per entry and bump the version, so a range entry can
+            # never be mistaken for a URL by mistake.
+            if ranged_mode:
+                state_version = 2
+                state_segments: List[Any] = [
+                    {"url": spec.url, "length": spec.length, "offset": spec.offset}
+                    if spec.has_range else {"url": spec.url}
+                    for spec in segment_specs
+                ]
+                self.logger.info(
+                    "Byte-range playlist: %d of %d segments are sub-ranges.",
+                    sum(1 for spec in segment_specs if spec.has_range), len(segment_specs),
+                )
+            else:
+                state_version = 1
+                state_segments = [spec.url for spec in segment_specs]
+
+            n = len(segment_specs) # Total amount of segments
             if n == 0:
                 raise UnknownError("No segments found for this playlist.")
                 # Shouldn't happen
@@ -2624,19 +2764,23 @@ class BaseCore:
                     # Create a semaphore to limit concurrent requests
                     semaphore = asyncio.Semaphore(workers)
 
-                    async def fetch_segment_with_semaphore(idx: int, url: str) -> Tuple[int, bool, bytes]:
+                    async def fetch_segment_with_semaphore(idx: int, spec: HLSSegment) -> Tuple[int, bool, bytes]:
+                        url = spec.url
+                        byte_range = (spec.offset or 0, spec.length) if spec.has_range else None
                         async with semaphore:
                             if stop_event is not None and stop_event.is_set():
                                 return idx, False, b""
 
-                            # Handle retries inside the coroutine
+                            # Handle retries inside the coroutine. Every attempt
+                            # repeats the identical URL, Range and source headers.
                             for attempt in range(max_seg_retries + 1):
                                 if stop_event is not None and stop_event.is_set():
                                     return idx, False, b""
 
                                 try:
                                     _, segment_data, is_success = await self.download_segment(
-                                        url, timeout, stop_event, headers=source_headers
+                                        url, timeout, stop_event, headers=source_headers,
+                                        byte_range=byte_range,
                                     )
                                     if is_success and segment_data:
                                         return idx, True, segment_data
@@ -2656,7 +2800,7 @@ class BaseCore:
 
                     segment_tasks = {
                         asyncio.create_task(
-                            fetch_segment_with_semaphore(i, segments[i]),
+                            fetch_segment_with_semaphore(i, segment_specs[i]),
                             name=f"hls-segment-{i}",
                         )
                         for i in target_indices
@@ -2763,7 +2907,7 @@ class BaseCore:
                 cancelled = True
 
             missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
-            missing_urls = [segments[i] for i in missing] # Missing URLs of segments
+            missing_urls = [segment_specs[i].url for i in missing] # Missing URLs of segments
             self.logger.info(
                 "Segment download finished: downloaded=%s/%s missing=%s cancelled=%s",
             downloaded_count, n, len(missing), cancelled)
@@ -2800,7 +2944,8 @@ class BaseCore:
                     assert  isinstance(segment_state_path, str)
                     self.logger.info(f"Writing segment state to: {segment_state_path}")
                     state = build_segment_state(
-                        segments=segments,
+                        segments=state_segments,
+                        version=state_version,
                         missing=missing,
                         segment_dir=segment_dir,
                         segment_index_width=width if segment_dir else 0,
@@ -2828,7 +2973,8 @@ class BaseCore:
                 if segment_state_path:
                     self.logger.info(f"Writing segment state to: {segment_state_path}")
                     state = build_segment_state(
-                        segments=segments,
+                        segments=state_segments,
+                        version=state_version,
                         missing=missing,
                         segment_dir=segment_dir,
                         segment_index_width=width if segment_dir else 0,
@@ -2873,7 +3019,8 @@ class BaseCore:
                     if segment_state_path:
                         self.logger.info(f"Writing segment state to: {segment_state_path}")
                         state = build_segment_state(
-                            segments=segments,
+                            segments=state_segments,
+                            version=state_version,
                             missing=missing,
                             segment_dir=segment_dir,
                             segment_index_width=width if segment_dir else 0,

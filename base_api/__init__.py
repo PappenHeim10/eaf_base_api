@@ -1,5 +1,6 @@
 __all__ = [
     "BaseCore",
+    "HLSSegment",
     "BaseMedia",
     "Cache",
     "CacheBackend",
@@ -78,6 +79,7 @@ from base_api.base import (
 from base_api.modules.config import config, DownloadConfigHLS, DownloadConfigRAW
 
 from .direct_adapter import DirectMediaAdapter
+from .models import HLSSegment
 
 
 from .provider import MediaProvider

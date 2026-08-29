@@ -378,7 +378,7 @@ def load_segment_state(state_path: str) -> Dict[str, Any]:
 
 def build_segment_state(
     *,
-    segments: List[str],
+    segments: List[Any],
     missing: List[int],
     segment_dir: str | None,
     segment_index_width: int,
@@ -386,11 +386,12 @@ def build_segment_state(
     quality: str,
     start_segment: int,
     m3u8_url: str | None,
-    created_at: str | None = None
+    created_at: str | None = None,
+    version: int = 1
 ) -> DownloadState:
     now = datetime.now(timezone.utc).isoformat()
     state = DownloadState(
-        version=1,
+        version=version,
         created_at=created_at or now,
         updated_at=None,
         m3u8_url=m3u8_url,
