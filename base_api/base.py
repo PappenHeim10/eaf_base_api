@@ -1680,7 +1680,8 @@ class BaseCore:
     def _merged_headers(self, override: Dict[str, str] | None) -> Dict[str, Any]:
         """
         Create request headers from current session headers + optional overrides.
-        Overrides win, session headers are the base.
+        Overrides win, session headers are the base. The session itself is never
+        modified here - an override exists for exactly one request.
         """
         if self.session is None:
             self.initialize_session()
@@ -1688,7 +1689,15 @@ class BaseCore:
         assert session is not None
         headers: Dict[str, Any] = cast(Dict[str, Any], cast(Any, dict(session.headers)))
         if override:
-            headers.update(override)
+            for key, value in override.items():
+                # HTTP header names are case-insensitive, but the session stores
+                # its keys lowercased while callers write "Referer". A plain
+                # dict.update would keep both spellings and put two lines on the
+                # wire; replace case-insensitively so the override really wins.
+                lower = key.lower()
+                for existing in [k for k in headers if k.lower() == lower]:
+                    del headers[existing]
+                headers[key] = value
         return headers
 
     def _merged_cookies(self, override: Dict[str, str] | None) -> Dict[str, Any]:
@@ -2091,6 +2100,7 @@ class BaseCore:
             self,
             m3u8_url: str,
             quality: str | int,
+            headers: Dict[str, str] | None = None,
     ) -> str:
         """
         Return the media-playlist URL for the requested quality.
@@ -2148,7 +2158,8 @@ class BaseCore:
 
         else:
             content = await self.fetch_text(
-                url=m3u8_url
+                url=m3u8_url,
+                headers=headers,
             )
 
             master = m3u8.loads(content)
@@ -2248,7 +2259,11 @@ class BaseCore:
             raise UnsupportedProtocolError(f"Unsupported source type: {getattr(source, 'source_type', 'None')}")
             
         m3u8_url_master = getattr(source, "url", "")
-        
+        # The source's own transport contract. Sent with every request that
+        # belongs to this source; a source without one behaves exactly as before.
+        raw_headers = getattr(source, "headers", None)
+        source_headers: Dict[str, str] | None = dict(raw_headers) if raw_headers else None
+
         segment_cache_key = SegmentCacheKey(m3u8_url_master, str(quality))
         _segments = self.cache.get_segments(segment_cache_key)
         if _segments is not None:
@@ -2256,12 +2271,14 @@ class BaseCore:
             return _segments
 
         # Resolve the quality-specific playlist URL (may still be a master in some edge cases)
-        playlist_url = await self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
+        playlist_url = await self.get_m3u8_by_quality(
+            m3u8_url=m3u8_url_master, quality=quality, headers=source_headers
+        )
         self.logger.debug("Trying to fetch segments from m3u8 -> %s", playlist_url)
 
         # M3U8s are volatile → don't cache
         content = await self.fetch_text(
-            url=playlist_url, cache_policy=CachePolicy.BYPASS
+            url=playlist_url, cache_policy=CachePolicy.BYPASS, headers=source_headers
         )
         parsed = m3u8.loads(content)
 
@@ -2274,7 +2291,7 @@ class BaseCore:
             media_url = urljoin(playlist_url, media_rel)
             self.logger.info("Resolved to new URL: %s", media_url)
             content = await self.fetch_text(
-                url=media_url, cache_policy=CachePolicy.BYPASS
+                url=media_url, cache_policy=CachePolicy.BYPASS, headers=source_headers
             )
             parsed = m3u8.loads(content)
             base_url = media_url
@@ -2332,7 +2349,8 @@ class BaseCore:
             self.logger.debug("Failed to remove directory %s: %s", path, e)
 
     async def download_segment(self, url: str, timeout: int, stop_event:
-                                asyncio.Event | None = None) -> tuple[str, bytes, bool]:
+                                asyncio.Event | None = None,
+                                headers: Dict[str, str] | None = None) -> tuple[str, bytes, bool]:
         """
         Attempt to download a single segment.
         Returns (url, content, success).
@@ -2341,7 +2359,7 @@ class BaseCore:
             if stop_event is not None and stop_event.is_set():
                 return url, b"", False # Stopping the download here
 
-            content = await self.fetch_bytes(url, timeout=timeout)
+            content = await self.fetch_bytes(url, timeout=timeout, headers=headers)
             return url, content, True
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.
@@ -2418,6 +2436,18 @@ class BaseCore:
             ios_support = configuration.ios_support
             timeout = timeout
             pre_resolved_m3u8_url = pre_resolved_m3u8
+            # Per-source transport headers, applied to every request this
+            # download makes (playlists and segments alike, fresh or resumed).
+            # Names only in the log - header values are not ours to print.
+            raw_source_headers = getattr(configuration.media_source, "headers", None)
+            source_headers: Dict[str, str] | None = (
+                dict(raw_source_headers) if raw_source_headers else None
+            )
+            if source_headers:
+                self.logger.debug(
+                    "Applying %d source-specific request header(s): %s",
+                    len(source_headers), sorted(source_headers),
+                )
 
             self.logger.info(
                 f"Threaded download start: quality={quality} path={path} remux={remux} start_segment={start_segment} "
@@ -2492,7 +2522,8 @@ class BaseCore:
                 class _TempSource:
                     source_type = "HLS"
                     url = m3u8_master
-                
+                    headers = source_headers or {}
+
                 segments = await self.get_segments(quality=quality, source=_TempSource())
                 total_before = len(segments)
                 if start_segment > 0:
@@ -2604,7 +2635,9 @@ class BaseCore:
                                     return idx, False, b""
 
                                 try:
-                                    _, segment_data, is_success = await self.download_segment(url, timeout, stop_event)
+                                    _, segment_data, is_success = await self.download_segment(
+                                        url, timeout, stop_event, headers=source_headers
+                                    )
                                     if is_success and segment_data:
                                         return idx, True, segment_data
                                 except Exception as exception:
