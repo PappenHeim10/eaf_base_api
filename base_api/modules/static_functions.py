@@ -535,12 +535,18 @@ def log_precondition_failed(logger, response: Response, attempt: int) -> None:
 
 
 def strip_title(
-    title: str, max_length: int = 255, default_name: str = "untitled"
+    title: str,
+    max_length: int = 255,
+    default_name: str = "untitled",
+    max_bytes: int = 245,
 ) -> str:
     """Sanitize a filename to be safe across Windows, macOS, Linux, and Android.
 
     Prevents path traversal, replaces illegal characters, handles Windows reserved
-    names, and trims to a safe length.
+    names, and trims to a safe length in both characters and encoded bytes.
+
+    ``max_bytes`` defaults to 245 to leave room for the extension the caller
+    appends (see :func:`truncate`).
     """
     if not title:
         return default_name
@@ -575,8 +581,12 @@ def strip_title(
     if name_only in reserved_names:
         sanitized = f"_{sanitized}"
 
-    # 7. Trim to max length, then re-strip trailing dots/spaces in case the slice cut mid-string
-    sanitized = sanitized[:max_length].rstrip(" .")
+    # 7. Trim to the character limit AND to the byte limit, then re-strip trailing
+    # dots/spaces in case a cut landed mid-string.
+    # The byte limit matters because filesystems cap the *encoded* name, not the
+    # character count: ext4 and Android allow 255 bytes, so 255 CJK characters are
+    # roughly three times over the limit even though they pass `max_length`.
+    sanitized = truncate(sanitized[:max_length], max_bytes=max_bytes).rstrip(" .")
 
     # 8. Return default fallback if sanitization leaves an empty string
     return sanitized if sanitized else default_name
