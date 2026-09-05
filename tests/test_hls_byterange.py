@@ -19,8 +19,6 @@ tests pin the replacement end to end:
 
 import asyncio
 import random
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -30,6 +28,7 @@ from base_api.models import HLSSegment, MediaSource
 from base_api.modules.config import DownloadConfigHLS, RuntimeConfig
 from base_api.modules.errors import PlaylistExtractionError
 from base_api.modules.static_functions import load_segment_state, segment_file_path
+from tests.loopback_server import QuietHandler, serving
 
 REFERER = {"Referer": "https://source.example/"}
 
@@ -470,7 +469,7 @@ async def test_a_rangeless_legacy_state_with_repeated_urls_is_discarded(tmp_path
 # --- the wire: a real loopback HTTP server, nothing mocked --------------------------
 
 
-class _RangeHandler(BaseHTTPRequestHandler):
+class _RangeHandler(QuietHandler):
     recorded: list[tuple[str, str | None, str | None]] = []
     honor_range = True
 
@@ -502,19 +501,13 @@ class _RangeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args):
-        pass
-
 
 @pytest.fixture
 def range_server():
     _RangeHandler.recorded = []
     _RangeHandler.honor_range = True
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _RangeHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}"
-    server.shutdown()
+    with serving(_RangeHandler) as base_url:
+        yield base_url
 
 
 @pytest.mark.asyncio

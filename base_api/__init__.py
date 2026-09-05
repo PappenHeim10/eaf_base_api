@@ -7,6 +7,7 @@ __all__ = [
     "CachePolicy",
     "Callback",
     "DownloadConfigHLS",
+    "DownloadConfigHTTP",
     "DownloadConfigRAW",
     "DataNotLoadedError",
     "ErrorAction",
@@ -15,16 +16,20 @@ __all__ = [
     "ErrorMode",
     "FieldNotLoadableError",
     "Helper",
+    "IncompleteBody",
     "ItemFetchError",
     "LoadState",
     "LoaderConfigurationError",
     "LoaderContractError",
     "MediaLoadError",
     "MediaLoadErrors",
+    "MediaSource",
+    "OversizedBody",
     "PageFetchError",
     "ResultOrder",
     "RequestCacheKey",
     "RequestRetriesExhausted",
+    "ResumeConflict",
     "RetryPolicy",
     "ScrapeErrorContext",
     "ScrapeOperationError",
@@ -45,13 +50,16 @@ from base_api.modules.errors import (
     DataNotLoadedError,
     ErrorHandlerError,
     FieldNotLoadableError,
+    IncompleteBody,
     ItemFetchError,
     LoaderConfigurationError,
     LoaderContractError,
     MediaLoadError,
     MediaLoadErrors,
+    OversizedBody,
     PageFetchError,
     RequestRetriesExhausted,
+    ResumeConflict,
     ScrapeOperationError,
     UnknownMediaFieldError,
 )
@@ -76,10 +84,15 @@ from base_api.base import (
     SegmentCacheKey,
     media_field,
 )
-from base_api.modules.config import config, DownloadConfigHLS, DownloadConfigRAW
+from base_api.modules.config import (
+    config,
+    DownloadConfigHLS,
+    DownloadConfigHTTP,
+    DownloadConfigRAW,
+)
 
 from .direct_adapter import DirectMediaAdapter
-from .models import HLSSegment
+from .models import HLSSegment, MediaSource
 
 
 from .provider import MediaProvider

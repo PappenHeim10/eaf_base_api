@@ -68,6 +68,51 @@ class DownloadConfigHLS(BaseConfigDownload):
 
 
 @dataclass
+class DownloadConfigHTTP(BaseConfigDownload):
+    """One progressive media file, fetched as a single resumable byte stream.
+
+    Deliberately not a variant of `DownloadConfigHLS`: nothing here has
+    segments, a segment directory, a playlist or a remux step, and nothing in
+    `DownloadConfigRAW` describes the resume contract this transport has. The
+    config type is what `BaseCore.download()` dispatches on, so the two
+    transports cannot be reached by accident from one another's configuration.
+
+    Only what a single-file download actually needs:
+
+    * `path` (inherited) - the final target. The file name is always the
+      caller's; a URL and a `Content-Disposition` never name a file here.
+    * `media_source` - the `MediaSource` to fetch, with its per-source request
+      headers.
+    * `expected_size` - the provider's stated total, when it stated one. Falls
+      back to `MediaSource.expected_size`. The wire's own length still wins for
+      the body actually being received.
+    * `state_path` - where the resume state lives. `None` disables resuming.
+    * `callback` (inherited) - `(written_bytes, total_bytes)`, `total_bytes`
+      being 0 while the total is unknown.
+    * `stop_event` (inherited) - honored between chunks and during backoff.
+    """
+
+    media_source: Any = None
+    expected_size: int | None = None
+    state_path: str | None = None
+    #: Upper bound on one write, and the granularity of the progress callback,
+    #: the stop check and the oversize guard. curl decides how large the chunks
+    #: it hands us are, so larger ones are split rather than written whole.
+    chunk_size: int = 1024 * 1024
+    #: How often the resume state is rewritten while bytes are flowing. The
+    #: state is always written after the file, so a crash between the two costs
+    #: at most this many bytes of resume progress and never corrupts anything.
+    state_flush_bytes: int = 8 * 1024 * 1024
+    #: `None` takes the runtime config's value, so a caller that tunes the
+    #: runtime does not have to repeat itself per download.
+    max_attempts: int | None = None
+    read_timeout: float | None = None
+    #: An explicit stop removes the partial file and its state. A network
+    #: failure never does - that partial file is a valid prefix to resume from.
+    cleanup_on_stop: bool = True
+
+
+@dataclass
 class DownloadConfigRAW(BaseConfigDownload):
     allow_multipart: bool = True
     max_workers: int = 5

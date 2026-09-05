@@ -362,3 +362,55 @@ class UnsupportedMediaTypeError(Exception):
 class AmbiguousProviderError(Exception):
     pass
 
+
+
+# Progressive HTTP transport errors
+#
+# Three failures a single-stream byte download has that segmented HLS does not.
+# They are their own types because the app layer has to tell them apart: one of
+# them means the local file is garbage, the other two mean it is still a valid
+# base to resume from.
+
+
+class ResumeConflict(BaseScraperError):
+    """The server's answer cannot be reconciled with the local partial file.
+
+    A 206 that starts at the wrong offset, a changed ETag / Last-Modified /
+    total size, a 412, or a 416 the local file does not satisfy. The transport
+    resolves this by restarting once at byte zero; the error only escapes when
+    that single automatic restart has already been spent, so it can never loop.
+    """
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class IncompleteBody(BaseScraperError):
+    """The response body ended before the stated total was written.
+
+    The bytes already on disk are valid - they are a prefix of the resource -
+    so the temporary file and its resume state are deliberately kept and a
+    later run continues at that offset.
+    """
+
+    def __init__(self, message: str, *, written: int, expected: int) -> None:
+        self.message = message
+        self.written = written
+        self.expected = expected
+        super().__init__(message)
+
+
+class OversizedBody(BaseScraperError):
+    """The server sent more bytes than the total it stated.
+
+    Unlike a short body this is not resumable: the file on disk contains data
+    that does not belong to the resource as described, so the temporary file is
+    removed rather than offered to a later resume.
+    """
+
+    def __init__(self, message: str, *, written: int, expected: int) -> None:
+        self.message = message
+        self.written = written
+        self.expected = expected
+        super().__init__(message)

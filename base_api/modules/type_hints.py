@@ -26,6 +26,48 @@ class DownloadState:
         return getattr(self, key)
 
 
+#: The `kind` every progressive-HTTP resume state carries. The HLS state and
+#: this one share the `.state/` directory, so the discriminator has to be in
+#: the payload: a reader that does not find exactly this value must treat the
+#: file as somebody else's and start fresh rather than misread its fields.
+PROGRESSIVE_STATE_KIND = "http-progressive"
+
+#: Schema version of `ProgressiveDownloadState`. An unknown version is
+#: discarded, never guessed at - a resume is only safe when every field means
+#: what this engine thinks it means.
+PROGRESSIVE_STATE_VERSION = 1
+
+
+@dataclass
+class ProgressiveDownloadState:
+    """Resume state of one progressive HTTP download.
+
+    `downloaded_bytes` is what the state *believes*; the temporary file's real
+    size is the local truth and wins whenever the two disagree. The validators
+    are kept so the next run can decide for itself whether the remote resource
+    is still the one those bytes came from - the transport never relies on the
+    server evaluating `If-Range` correctly.
+    """
+
+    version: int
+    kind: str
+    created_at: Any
+    updated_at: Any
+    url: str
+    output_path: Path | str
+    temp_path: Path | str
+    total_size: int | None
+    downloaded_bytes: int
+    etag: str | None
+    #: Whether `etag` arrived as a `W/`-prefixed weak validator. A weak ETag is
+    #: never put into `If-Range`; it is only ever compared by this engine.
+    etag_weak: bool
+    last_modified: str | None
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
 # Download state is used for the literal file that tracks it
 @dataclass
 class DownloadReport:

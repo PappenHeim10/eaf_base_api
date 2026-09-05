@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 import os
 import time
+import random
 import hashlib
 import string
 import shutil
@@ -13,7 +14,7 @@ import threading
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from enum import StrEnum
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from dataclasses import MISSING, dataclass, field, fields
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
@@ -36,9 +37,14 @@ from base_api.modules.static_functions import (
     load_segment_state, parse_retry_after, log_precondition_failed,
     write_segment_state, build_segment_state, segment_file_path,
     parse_challenge, other_challenge, least_factors, available_qualities,
-    choose_variant, collect_variants, get_segment_index_width
+    choose_variant, collect_variants, get_segment_index_width,
+    build_progressive_state, load_progressive_state, normalize_etag,
+    parse_content_range, parse_unsatisfied_content_range, write_progressive_state,
 )
-from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig
+from base_api.modules.config import (
+    config, RuntimeConfig, DownloadConfigHLS, DownloadConfigHTTP,
+    DownloadConfigRAW, IteratorConfig,
+)
 from base_api.models import HLSSegment
 from base_api.modules.progress_bars import Callback
 from base_api.modules.logger import configure_app_logging
@@ -1563,6 +1569,56 @@ class Helper(Generic[MediaT]):
             ) from handler_error
 
 
+class ProgressiveAction(StrEnum):
+    """What one attempt of a progressive download tells its orchestrator to do.
+
+    Terminal failures are raised, not returned - the caller has to be able to
+    tell "this download is over" from "this attempt is over". These four are
+    the outcomes that leave the download itself still alive.
+    """
+
+    #: The body was streamed to its end. The file still has to pass the size
+    #: check before it is moved into place.
+    COMPLETED = "completed"
+    #: A 416 whose stated total matches the temporary file exactly: the bytes
+    #: are already all of them, and only the finalization is missing.
+    ALREADY_COMPLETE = "already_complete"
+    #: The remote resource cannot be reconciled with the local partial file.
+    #: Recovered by discarding both and starting at byte zero, exactly once.
+    RESTART = "restart"
+    #: Transient: retry the same offset after a backoff.
+    RETRY = "retry"
+    #: The stop event fired.
+    CANCELLED = "cancelled"
+
+
+@dataclass(slots=True)
+class ProgressiveOutcome:
+    """One attempt's result, including everything a resume needs to survive it.
+
+    The validators travel back with the outcome so that a connection that dies
+    mid-body still teaches the resume state which resource those bytes came
+    from - without that, the next run has bytes it cannot vouch for.
+    """
+
+    action: ProgressiveAction
+    written: int = 0
+    total: int | None = None
+    etag: str | None = None
+    etag_weak: bool = False
+    last_modified: str | None = None
+    retry_after: float | None = None
+    reason: str = ""
+
+    @property
+    def validators(self) -> Dict[str, Any]:
+        return {
+            "etag": self.etag,
+            "etag_weak": self.etag_weak,
+            "last_modified": self.last_modified,
+        }
+
+
 class BaseCore:
     """
     The base class which has all necessary functions for other API packages
@@ -2453,18 +2509,34 @@ class BaseCore:
 
     async def download(
         self,
-        configuration: DownloadConfigHLS
+        configuration: DownloadConfigHLS | DownloadConfigHTTP
     ) -> DownloadReport | bool:
-        """
-        :param video:
-        :param configuration:
-        :return:
+        """Download one media source; the configuration's type picks the transport.
+
+        `DownloadConfigHLS` takes the segmented playlist path, `DownloadConfigHTTP`
+        the progressive single-stream one. The transport is never inferred from
+        the URL, the file extension or the response's content type: a caller
+        that built an HLS configuration gets the HLS engine even if the URL ends
+        in `.mp4`, and a configuration this engine has no transport for is an
+        error rather than a silent fallback onto the wrong one.
+
+        :param configuration: the transport-specific download configuration
+        :return: a DownloadReport when one was requested, else a bool
         """
 
         if configuration.callback is None:
             # Use a terminal text progressbar by default
             configuration.callback = Callback.text_progress_bar
             self.logger.debug("download: no callback provided, using default text progress bar")
+
+        if isinstance(configuration, DownloadConfigHTTP):
+            return await self.progressive_download(configuration)
+
+        if not isinstance(configuration, DownloadConfigHLS):
+            raise TypeError(
+                "BaseCore.download() takes a DownloadConfigHLS or a DownloadConfigHTTP, "
+                f"got {type(configuration).__name__}"
+            )
 
         media_source = configuration.media_source
         if media_source is None:
@@ -2494,6 +2566,825 @@ class BaseCore:
             timeout=self.configuration.timeout,
             max_workers=self.configuration.max_workers_download,
         )
+
+    # --- progressive HTTP transport -------------------------------------------
+    #
+    # One media file, one stream, resumable by byte offset. Deliberately not a
+    # degenerate case of the HLS engine: there is no playlist to re-resolve, no
+    # segment directory to reconcile, and the unit of progress is a byte rather
+    # than a fragment - so the resume contract, the failure classification and
+    # the cleanup rules are all different ones.
+
+    #: The only schemes this transport fetches. Checked on the source URL and
+    #: again on every redirect target.
+    _PROGRESSIVE_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https"})
+    #: A redirect chain is remote input; without a bound it is a denial of
+    #: service against ourselves.
+    _PROGRESSIVE_MAX_REDIRECTS: ClassVar[int] = 5
+    _PROGRESSIVE_REDIRECT_STATUS: ClassVar[frozenset[int]] = frozenset({301, 302, 303, 307, 308})
+    #: Worth another attempt at the same offset. 5xx is handled alongside these.
+    _PROGRESSIVE_TRANSIENT_STATUS: ClassVar[frozenset[int]] = frozenset({408, 425, 429})
+
+    @classmethod
+    def _validate_progressive_url(cls, url: Any) -> str:
+        """Return `url` iff this transport is allowed to fetch it.
+
+        Applied to the source's own URL and again to every redirect target,
+        because a redirect is a destination chosen by a remote party: a chain
+        that starts at https and ends at a `file://` URL or at one carrying
+        credentials has to be refused at the hop that introduces it.
+
+        Private and link-local address ranges are deliberately *not* filtered
+        here - that is a separate decision with its own failure modes (split
+        DNS, self-hosted instances on a LAN) and is not part of this transport.
+        """
+        if not isinstance(url, str) or not url.strip():
+            raise MediaSourceError("A progressive download needs a URL.")
+
+        candidate = url.strip()
+        try:
+            parts = urlsplit(candidate)
+            scheme = (parts.scheme or "").lower()
+            username, password, hostname = parts.username, parts.password, parts.hostname
+        except ValueError as exc:
+            raise MediaSourceError(f"Unusable media URL: {exc}") from exc
+
+        if scheme not in cls._PROGRESSIVE_SCHEMES:
+            raise MediaSourceError(
+                f"Refusing to fetch scheme {scheme!r}; only http and https are downloaded."
+            )
+        # Userinfo turns the URL itself into a credential: it would be logged,
+        # written into the resume state and replayed on every retry and redirect.
+        if username is not None or password is not None:
+            raise MediaSourceError("Refusing a media URL that carries credentials in its userinfo.")
+        if not hostname:
+            raise MediaSourceError("Refusing a media URL without a host.")
+        return candidate
+
+    def _progressive_headers(
+        self,
+        source_headers: Dict[str, str] | None,
+        offset: int,
+        validators: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the headers for one progressive attempt. Request-local, always.
+
+        Session headers plus this source's own, exactly like every other media
+        request, and then the three headers this transport owns. The source's
+        dict is never written to, so two downloads running on one core cannot
+        pick up each other's Range.
+        """
+        headers = self._merged_headers(dict(source_headers) if source_headers else None)
+        # The transport owns these three; a source that carries its own is
+        # overruled rather than merged with, so the request cannot end up with
+        # two Ranges or with a compressed body.
+        for existing in [
+            key for key in headers if key.lower() in {"accept-encoding", "range", "if-range"}
+        ]:
+            del headers[existing]
+        # Identity encoding: a compressed body makes Content-Length describe the
+        # transfer instead of the resource, which would silently break both the
+        # resume offset and the completeness check.
+        headers["Accept-Encoding"] = "identity"
+
+        if offset > 0:
+            headers["Range"] = f"bytes={offset}-"
+            entity_tag = validators.get("etag")
+            if entity_tag and not validators.get("etag_weak"):
+                # Only a strong entity tag. RFC 9110 allows nothing else as a
+                # range precondition, and a weak one handed to a server that
+                # accepts it anyway produces a silently wrong file.
+                headers["If-Range"] = entity_tag
+        return headers
+
+    def _truncate_file(self, path: str, size: int) -> bool:
+        """Cut `path` back to `size` bytes. False means the file is now gone."""
+        if size <= 0:
+            self._safe_remove(path)
+            return False
+        try:
+            with open(path, "r+b") as handle:
+                handle.truncate(size)
+            return True
+        except OSError as exc:
+            self.logger.warning(
+                "Could not truncate %s to %s bytes (%s); discarding it.", path, size, exc
+            )
+            self._safe_remove(path)
+            return False
+
+    def _plan_progressive_resume(
+        self, state: Mapping[str, Any] | None, tmp_path: str
+    ) -> tuple[int, Dict[str, Any]]:
+        """Decide where to continue, with the temporary file as the truth.
+
+        The state records what the last run *believed* it had written; the file
+        records what actually reached the disk. They can disagree - a crash
+        between the two writes is the case the state file exists for - and the
+        only safe reconciliation is the smaller of the two, with the file cut
+        back to it so that the next byte written really is byte `offset`.
+        """
+        try:
+            tmp_size = os.path.getsize(tmp_path)
+        except OSError:
+            tmp_size = 0
+
+        if state is None:
+            # A temporary file with no state carries no validators, so nothing
+            # can establish that its bytes belong to the resource being fetched
+            # now. Appending to it would produce a file made of two videos.
+            if tmp_size:
+                self.logger.info(
+                    "Discarding a %s byte temporary file that has no resume state.", tmp_size
+                )
+            self._safe_remove(tmp_path)
+            return 0, {}
+
+        try:
+            recorded = int(state.get("downloaded_bytes") or 0)
+        except (TypeError, ValueError):
+            recorded = 0
+
+        offset = max(0, min(recorded, tmp_size))
+        if offset != tmp_size:
+            self.logger.warning(
+                "Resume state records %s bytes and the temporary file holds %s; continuing at %s.",
+                recorded, tmp_size, offset,
+            )
+            if not self._truncate_file(tmp_path, offset):
+                offset = 0
+
+        total = state.get("total_size")
+        return offset, {
+            "etag": state.get("etag"),
+            "etag_weak": bool(state.get("etag_weak")),
+            "last_modified": state.get("last_modified"),
+            "total": int(total) if isinstance(total, int) else None,
+        }
+
+    @staticmethod
+    def _progressive_validator_mismatch(
+        known: Mapping[str, Any],
+        *,
+        etag: str | None,
+        etag_weak: bool,
+        last_modified: str | None,
+        total: int | None,
+    ) -> str | None:
+        """Why a resumed answer is not the resource we started on, or None.
+
+        Compared here rather than delegated to `If-Range`, because a server that
+        mishandles `If-Range` answers 206 for a resource that changed - and the
+        result is a file assembled from two different videos that nothing
+        downstream detects. Anything that cannot be *confirmed* identical counts
+        as changed: a state that had a validator and an answer that has none
+        means the only evidence we had is gone.
+
+        A weak ETag is compared for equality here even though it may never be
+        sent as a range precondition. Weak equality plus an unchanged total is
+        the strongest statement such a server offers; the alternative would be
+        to refuse every resume against it.
+        """
+        known_etag = known.get("etag")
+        if known_etag:
+            if not etag:
+                return "the response no longer carries an ETag"
+            if etag != known_etag or bool(known.get("etag_weak")) != etag_weak:
+                return "the ETag changed"
+
+        known_modified = known.get("last_modified")
+        if known_modified:
+            if not last_modified and not known_etag:
+                return "the response no longer carries Last-Modified"
+            if last_modified and last_modified != known_modified:
+                return "Last-Modified changed"
+
+        known_total = known.get("total")
+        if known_total is not None and total is not None and int(known_total) != int(total):
+            return f"the total size changed from {known_total} to {total}"
+        return None
+
+    @staticmethod
+    def _parse_content_length(value: Any) -> int | None:
+        try:
+            length = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return length if length >= 0 else None
+
+    def _progressive_backoff(self, attempt: int) -> float:
+        """The same bounded exponential backoff `request()` retries on."""
+        settings = self.configuration
+        delay = settings.request_retry_initial_delay * (
+            settings.request_multiplier ** max(0, attempt - 1)
+        )
+        return min(delay, settings.request_retry_max_delay) + random.uniform(
+            0.0, settings.request_retry_jitter
+        )
+
+    async def _sleep_unless_stopped(self, delay: float, stop_event: Any) -> bool:
+        """Wait `delay` seconds; True means the stop event fired first.
+
+        Backoff is where a cancelled download would otherwise sit for up to the
+        maximum retry delay before noticing, so the wait itself is cancellable.
+        Both event flavors work: `asyncio.Event.wait()` is awaited,
+        `threading.Event.wait(timeout)` is offloaded to a thread.
+        """
+        if stop_event is None:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return False
+        if stop_event.is_set():
+            return True
+        if delay <= 0:
+            return False
+
+        wait_method = getattr(stop_event, "wait", None)
+        if asyncio.iscoroutinefunction(wait_method):
+            try:
+                await asyncio.wait_for(stop_event.wait(), delay)
+                return True
+            except (asyncio.TimeoutError, TimeoutError):
+                return False
+        if wait_method is None:
+            await asyncio.sleep(delay)
+            return bool(stop_event.is_set())
+        return bool(await asyncio.to_thread(cast(Any, wait_method), delay))
+
+    async def _progressive_attempt(
+        self,
+        *,
+        url: str,
+        tmp_path: str,
+        offset: int,
+        validators: Mapping[str, Any],
+        expected_size: int | None,
+        chunk_size: int,
+        timeout: float,
+        stop_event: Any,
+        source_headers: Dict[str, str] | None,
+        on_progress: Callable[[int, int | None, Mapping[str, Any]], None],
+    ) -> ProgressiveOutcome:
+        """One request, its redirects, and as much of the body as it delivers.
+
+        Returns a `ProgressiveOutcome` for everything the download can survive
+        and raises for everything it cannot: a terminal status, an oversized
+        body, a filesystem failure. The body is never materialized - it is
+        streamed and written in bounded pieces, so a 4 GB file costs a chunk of
+        memory rather than 4 GB of it.
+        """
+        if self.session is None:
+            self.initialize_session()
+        session = self.session
+        assert session is not None
+
+        current_url = url
+        redirects = 0
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return ProgressiveOutcome(action=ProgressiveAction.CANCELLED, written=offset)
+
+            headers = self._progressive_headers(source_headers, offset, validators)
+            cookies = self._merged_cookies(None)
+            await self.enforce_delay()
+            self.total_requests += 1
+            self.logger.debug(
+                "Progressive GET %s offset=%s header_names=%s",
+                current_url, offset, sorted(headers),
+            )
+
+            async with cast(Any, session).stream(
+                "GET",
+                current_url,
+                headers=headers,
+                cookies=cookies,
+                timeout=timeout,
+                allow_redirects=False,
+                accept_encoding="identity",
+            ) as response:
+                status = int(response.status_code)
+
+                if status in self._PROGRESSIVE_REDIRECT_STATUS:
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise HTTPStatusError(
+                            f"HTTP {status} without a Location header for {current_url}",
+                            status_code=status,
+                            url=current_url,
+                        )
+                    redirects += 1
+                    if redirects > self._PROGRESSIVE_MAX_REDIRECTS:
+                        raise HTTPStatusError(
+                            f"More than {self._PROGRESSIVE_MAX_REDIRECTS} redirects starting at {url}",
+                            status_code=status,
+                            url=current_url,
+                        )
+                    # Validated again: the previous hop's approval says nothing
+                    # about where this one points.
+                    current_url = self._validate_progressive_url(urljoin(current_url, location))
+                    self.logger.debug("Progressive redirect %s -> %s", status, current_url)
+                    continue
+
+                if status == 429:
+                    retry_after = parse_retry_after(logger=self.logger, response=response)
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RETRY,
+                        written=offset,
+                        retry_after=retry_after,
+                        reason="HTTP 429 rate limited",
+                    )
+
+                if status in self._PROGRESSIVE_TRANSIENT_STATUS or 500 <= status < 600:
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RETRY, written=offset, reason=f"HTTP {status}"
+                    )
+
+                if status == 416:
+                    # The one status whose recovery depends on the local file: a
+                    # server refusing our range while stating the resource's size
+                    # may just be telling us we already have all of it.
+                    stated_total = parse_unsatisfied_content_range(
+                        response.headers.get("Content-Range")
+                    )
+                    try:
+                        local_size = os.path.getsize(tmp_path)
+                    except OSError:
+                        local_size = 0
+                    if stated_total is not None and local_size > 0 and stated_total == local_size:
+                        entity_tag, tag_is_weak = normalize_etag(response.headers.get("ETag"))
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.ALREADY_COMPLETE,
+                            written=local_size,
+                            total=stated_total,
+                            etag=entity_tag,
+                            etag_weak=tag_is_weak,
+                            last_modified=response.headers.get("Last-Modified"),
+                            reason="HTTP 416 states the local file is already the whole resource",
+                        )
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RESTART,
+                        reason=f"HTTP 416 (stated total {stated_total}, local file {local_size} bytes)",
+                    )
+
+                if status == 412:
+                    # A precondition we set was rejected, so the resource is not
+                    # the one the local bytes came from. Not logged through
+                    # `log_precondition_failed`: that helper previews the body,
+                    # and this response's body is a stream we must not consume.
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RESTART, reason="HTTP 412 precondition failed"
+                    )
+
+                if status in {401, 403}:
+                    raise AccessDeniedError(
+                        f"Request blocked by server (HTTP {status}) for {current_url}"
+                    )
+                if status == 410:
+                    raise ResourceGone(f"Resource gone (HTTP 410) for URL: {current_url}")
+                if status not in {200, 206}:
+                    raise HTTPStatusError(
+                        f"HTTP {status} for {current_url}", status_code=status, url=current_url
+                    )
+
+                entity_tag, tag_is_weak = normalize_etag(response.headers.get("ETag"))
+                last_modified = response.headers.get("Last-Modified")
+                meta: Dict[str, Any] = {
+                    "etag": entity_tag,
+                    "etag_weak": tag_is_weak,
+                    "last_modified": last_modified,
+                }
+
+                if status == 206:
+                    if offset <= 0:
+                        # We asked for the whole resource. A partial answer has
+                        # no place we could put it.
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RESTART,
+                            reason="HTTP 206 for a request that carried no Range",
+                        )
+                    parsed = parse_content_range(response.headers.get("Content-Range"))
+                    if parsed is None:
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RESTART,
+                            reason=(
+                                "HTTP 206 without a parsable Content-Range "
+                                f"({response.headers.get('Content-Range')!r})"
+                            ),
+                        )
+                    first, _last, complete = parsed
+                    if first != offset:
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RESTART,
+                            reason=f"HTTP 206 starts at byte {first}, expected {offset}",
+                        )
+                    mismatch = self._progressive_validator_mismatch(
+                        validators,
+                        etag=entity_tag,
+                        etag_weak=tag_is_weak,
+                        last_modified=last_modified,
+                        total=complete,
+                    )
+                    if mismatch is not None:
+                        return ProgressiveOutcome(action=ProgressiveAction.RESTART, reason=mismatch)
+                    write_offset = offset
+                    total = complete if complete is not None else expected_size
+                else:
+                    # HTTP 200: either we never asked for a range, or the server
+                    # ignored the one we sent. Both mean this body is the whole
+                    # resource, so the file is rewritten from byte zero -
+                    # appending would splice a second copy onto the first.
+                    if offset > 0:
+                        self.logger.warning(
+                            "Server answered 200 to a Range request for %s; "
+                            "rewriting the file from byte zero.",
+                            current_url,
+                        )
+                    write_offset = 0
+                    body_length = self._parse_content_length(response.headers.get("Content-Length"))
+                    total = body_length if body_length is not None else expected_size
+
+                if write_offset and not os.path.exists(tmp_path):
+                    # Nothing to append to after all; the resource is fetched whole.
+                    self.logger.warning(
+                        "The temporary file for %s vanished before the body arrived; "
+                        "writing from byte zero.",
+                        current_url,
+                    )
+                    write_offset = 0
+
+                if (
+                    total is not None
+                    and expected_size is not None
+                    and int(total) != int(expected_size)
+                ):
+                    self.logger.warning(
+                        "The provider stated %s bytes for %s but the response states %s; "
+                        "the response wins for this body.",
+                        expected_size, current_url, total,
+                    )
+
+                written = write_offset
+                on_progress(written, total, meta)
+
+                handle = open(tmp_path, "wb" if write_offset == 0 else "r+b")
+                try:
+                    if write_offset:
+                        handle.seek(write_offset)
+                        handle.truncate()
+
+                    buffer = bytearray()
+
+                    async def flush(piece: bytes) -> None:
+                        nonlocal written
+                        await asyncio.to_thread(handle.write, piece)
+                        written += len(piece)
+                        if total is not None and written > total:
+                            raise OversizedBody(
+                                f"{current_url} sent more than the {total} bytes it stated",
+                                written=written,
+                                expected=int(total),
+                            )
+                        on_progress(written, total, meta)
+
+                    try:
+                        async for raw_chunk in response.aiter_content():
+                            if stop_event is not None and stop_event.is_set():
+                                return ProgressiveOutcome(
+                                    action=ProgressiveAction.CANCELLED,
+                                    written=written,
+                                    total=total,
+                                    **meta,
+                                )
+                            if raw_chunk:
+                                buffer += raw_chunk
+                            # curl decides how much it hands us; the write size,
+                            # the progress granularity and the oversize check are
+                            # ours, so the stream is re-cut to `chunk_size`.
+                            while len(buffer) >= chunk_size:
+                                # Checked per written chunk, not only per chunk
+                                # curl delivers: one curl chunk can be the whole
+                                # small file, and a stop must not have to wait
+                                # for the next network read to be noticed.
+                                if stop_event is not None and stop_event.is_set():
+                                    return ProgressiveOutcome(
+                                        action=ProgressiveAction.CANCELLED,
+                                        written=written,
+                                        total=total,
+                                        **meta,
+                                    )
+                                piece = bytes(buffer[:chunk_size])
+                                del buffer[:chunk_size]
+                                await flush(piece)
+                        if buffer:
+                            if stop_event is not None and stop_event.is_set():
+                                return ProgressiveOutcome(
+                                    action=ProgressiveAction.CANCELLED,
+                                    written=written,
+                                    total=total,
+                                    **meta,
+                                )
+                            await flush(bytes(buffer))
+                    except (RequestsError, asyncio.TimeoutError, TimeoutError) as exc:
+                        # The connection died mid-body. Everything already
+                        # written is a valid prefix, so this is a retry at the
+                        # new offset - and the validators travel back with it so
+                        # the resume can prove those bytes still belong together.
+                        self.logger.warning(
+                            "Progressive stream for %s broke after %s bytes: %s",
+                            current_url, written, exc,
+                        )
+                        if buffer:
+                            # Bytes that arrived before the break are still a
+                            # valid prefix; discarding them would make the resume
+                            # re-fetch up to one chunk for no reason.
+                            await flush(bytes(buffer))
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RETRY,
+                            written=written,
+                            total=total,
+                            reason=f"{type(exc).__name__}: {exc}",
+                            **meta,
+                        )
+                finally:
+                    handle.close()
+
+                return ProgressiveOutcome(
+                    action=ProgressiveAction.COMPLETED, written=written, total=total, **meta
+                )
+
+    async def progressive_download(self, configuration: DownloadConfigHTTP) -> bool:
+        """Download one progressive media file as a single resumable stream.
+
+        Sequential by design: one connection, one file, appended to. Parallel
+        multipart would need every part's server to agree on ranges *and* on the
+        resource staying byte-identical for the whole download, which is exactly
+        the assumption the resume contract below refuses to make.
+
+        Returns True when the file is complete and in place, False when the stop
+        event ended it. Every other failure raises a typed transport error the
+        caller can act on, rather than a bare False that says only "something".
+        """
+        media_source = configuration.media_source
+        if media_source is None:
+            raise MediaSourceError("No media source provided.")
+        if getattr(media_source, "source_type", None) != "HTTP":
+            raise UnsupportedProtocolError(
+                "The progressive transport downloads HTTP sources, got "
+                f"{getattr(media_source, 'source_type', 'None')!r}"
+            )
+
+        source_url = self._validate_progressive_url(getattr(media_source, "url", None))
+        # The target file name is the caller's, always. Neither the URL's last
+        # path segment nor a Content-Disposition ever names a file here: both are
+        # remote input, and a download must not be able to choose where on the
+        # filesystem it lands.
+        target = str(configuration.path)
+        tmp_path = f"{target}.tmp"
+        state_path = configuration.state_path
+        callback = configuration.callback
+        stop_event = configuration.stop_event
+        chunk_size = max(1, int(configuration.chunk_size))
+        flush_bytes = max(chunk_size, int(configuration.state_flush_bytes))
+        timeout = float(
+            configuration.read_timeout
+            if configuration.read_timeout is not None
+            else self.configuration.timeout
+        )
+        max_attempts = max(
+            1,
+            int(
+                configuration.max_attempts
+                if configuration.max_attempts is not None
+                else self.configuration.request_attempts
+            ),
+        )
+        raw_headers = getattr(media_source, "headers", None)
+        source_headers: Dict[str, str] = dict(raw_headers) if raw_headers else {}
+        expected_size = configuration.expected_size
+        if expected_size is None:
+            expected_size = getattr(media_source, "expected_size", None)
+
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        self.logger.info(
+            "Progressive download start: path=%s state_path=%s expected_size=%s chunk_size=%s "
+            "max_attempts=%s timeout=%s header_names=%s",
+            target, state_path, expected_size, chunk_size, max_attempts, timeout,
+            sorted(source_headers),
+        )
+
+        state = load_progressive_state(state_path) if state_path else None
+        if state is not None and state.get("url") != source_url:
+            # A different URL means different bytes, whatever the file holds.
+            self.logger.info(
+                "Resume state at %s was written for another URL; starting fresh.", state_path
+            )
+            self._safe_remove(tmp_path)
+            self._safe_remove(state_path)
+            state = None
+
+        offset, validators = self._plan_progressive_resume(state, tmp_path)
+        if expected_size is None and validators.get("total") is not None:
+            expected_size = int(cast(int, validators["total"]))
+
+        state_created_at: str | None = cast(Any, state.get("created_at")) if state else None
+        last_persisted = offset
+
+        def persist(written: int, total: int | None, meta: Mapping[str, Any]) -> None:
+            """Write the resume state. Always after the bytes, never before.
+
+            A state ahead of the file would claim progress the file cannot back
+            up; a state behind it only costs the difference on the next run,
+            because the resume takes the smaller of the two.
+            """
+            nonlocal state_created_at, last_persisted
+            if not state_path:
+                return
+            record = build_progressive_state(
+                url=source_url,
+                output_path=target,
+                temp_path=tmp_path,
+                total_size=total,
+                downloaded_bytes=written,
+                etag=cast(Any, meta.get("etag")),
+                etag_weak=bool(meta.get("etag_weak")),
+                last_modified=cast(Any, meta.get("last_modified")),
+                created_at=state_created_at,
+            )
+            try:
+                write_progressive_state(state_path, record)
+            except OSError as exc:
+                self.logger.warning("Could not persist resume state %s: %s", state_path, exc)
+                return
+            state_created_at = cast(str, record.created_at)
+            last_persisted = written
+
+        def on_progress(written: int, total: int | None, meta: Mapping[str, Any]) -> None:
+            if callback is not None:
+                # An unknown total is reported as 0 rather than guessed at: a
+                # progress bar that invents a denominator lies about the end.
+                callback(written, int(total) if total else 0)
+            if state_path and written - last_persisted >= flush_bytes:
+                persist(written, total, meta)
+
+        def replan(written: int, total: int | None, meta: Mapping[str, Any]) -> None:
+            nonlocal offset, validators, expected_size
+            if total is not None:
+                expected_size = int(total)
+            offset, validators = self._plan_progressive_resume(
+                {
+                    "downloaded_bytes": written,
+                    "etag": meta.get("etag"),
+                    "etag_weak": meta.get("etag_weak"),
+                    "last_modified": meta.get("last_modified"),
+                    "total_size": total,
+                },
+                tmp_path,
+            )
+
+        def cancel(written: int, total: int | None, meta: Mapping[str, Any]) -> bool:
+            """An explicit stop. The partial file goes, unless asked otherwise."""
+            self.logger.warning(
+                "Progressive download cancelled after %s bytes (cleanup_on_stop=%s).",
+                written, configuration.cleanup_on_stop,
+            )
+            if configuration.cleanup_on_stop:
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+            else:
+                persist(written, total, meta)
+            return False
+
+        restarts = 0
+        attempts = 0
+        last_error: Exception | None = None
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return cancel(offset, expected_size, validators)
+
+            try:
+                outcome = await self._progressive_attempt(
+                    url=source_url,
+                    tmp_path=tmp_path,
+                    offset=offset,
+                    validators=validators,
+                    expected_size=expected_size,
+                    chunk_size=chunk_size,
+                    timeout=timeout,
+                    stop_event=stop_event,
+                    source_headers=source_headers,
+                    on_progress=on_progress,
+                )
+            except (RequestsError, asyncio.TimeoutError, TimeoutError) as exc:
+                # A failure before any response header arrived: nothing new was
+                # learned about the resource, so the current plan stands.
+                last_error = exc
+                outcome = ProgressiveOutcome(
+                    action=ProgressiveAction.RETRY,
+                    written=offset,
+                    total=expected_size,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    etag=cast(Any, validators.get("etag")),
+                    etag_weak=bool(validators.get("etag_weak")),
+                    last_modified=cast(Any, validators.get("last_modified")),
+                )
+            except OversizedBody:
+                # The bytes on disk contain data that is not the resource as
+                # described; unlike a short body this cannot be resumed from.
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+                raise
+
+            if outcome.action is ProgressiveAction.CANCELLED:
+                return cancel(outcome.written, outcome.total, outcome.validators)
+
+            if outcome.action is ProgressiveAction.RETRY:
+                if outcome.written > last_persisted:
+                    persist(outcome.written, outcome.total, outcome.validators)
+                attempts += 1
+                if attempts >= max_attempts:
+                    error = last_error or NetworkRequestError(outcome.reason or "transient failure")
+                    self.logger.error(
+                        "Progressive download of %s failed after %s attempts.", source_url, attempts
+                    )
+                    raise RequestRetriesExhausted(source_url, attempts, error)
+                delay = (
+                    outcome.retry_after
+                    if outcome.retry_after is not None
+                    else self._progressive_backoff(attempts)
+                )
+                self.logger.warning(
+                    "Progressive attempt %s/%s for %s failed (%s); retrying in %.2fs.",
+                    attempts, max_attempts, source_url, outcome.reason, delay,
+                )
+                if await self._sleep_unless_stopped(delay, stop_event):
+                    return cancel(outcome.written, outcome.total, outcome.validators)
+                replan(outcome.written, outcome.total, outcome.validators)
+                continue
+
+            if outcome.action is ProgressiveAction.RESTART:
+                if restarts >= 1:
+                    # One automatic restart, never two: a server that keeps
+                    # contradicting itself has to surface as an error rather than
+                    # re-downloading the same file forever.
+                    raise ResumeConflict(
+                        f"Resuming {source_url} failed again after a fresh start: {outcome.reason}"
+                    )
+                restarts += 1
+                self.logger.warning("Restarting %s at byte zero: %s", source_url, outcome.reason)
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+                offset, validators = 0, {}
+                last_persisted = 0
+                state_created_at = None
+                continue
+
+            # COMPLETED or ALREADY_COMPLETE. The file on disk decides, not the
+            # byte counter: the counter is what we think we wrote, the size is
+            # what is actually there to move into place.
+            total = outcome.total
+            try:
+                actual = os.path.getsize(tmp_path)
+            except OSError as exc:
+                raise UnknownError(
+                    f"The temporary file {tmp_path} disappeared before it could be finalized: {exc}"
+                ) from exc
+
+            if total is not None and actual < total:
+                # A valid prefix: keep it and its state so a later run continues.
+                persist(actual, total, outcome.validators)
+                raise IncompleteBody(
+                    f"{source_url} delivered {actual} of {total} bytes",
+                    written=actual,
+                    expected=int(total),
+                )
+            if total is not None and actual > total:
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+                raise OversizedBody(
+                    f"{source_url} delivered {actual} bytes but stated {total}",
+                    written=actual,
+                    expected=int(total),
+                )
+
+            # No PyAV, no remux, no container inspection: a progressive MP4 is
+            # already the file the user asked for, and opening it would only add
+            # a way to fail after the bytes are correct.
+            self._replace_with_retry(tmp_path, target)
+            self._safe_remove(state_path)
+            if callback is not None:
+                # The total is known now even when the server never stated one:
+                # it is exactly what arrived.
+                callback(actual, int(total) if total is not None else actual)
+            self.logger.info(
+                "Progressive download completed: path=%s bytes=%s restarts=%s retries=%s",
+                target, actual, restarts, attempts,
+            )
+            return True
 
     async def threaded_download(
         self: "BaseCore",
