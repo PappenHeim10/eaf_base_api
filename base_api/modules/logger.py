@@ -73,4 +73,12 @@ def configure_app_logging(
         http_handler.setFormatter(formatter)
         logger.addHandler(http_handler)
 
+    if logger_name and logger.handlers:
+        # A named logger that carries its own handlers must not also hand the
+        # record to the root logger: an embedding application configures root
+        # too, so every message - including exception tracebacks - was emitted
+        # twice, in two different formats. The root logger is left alone; it has
+        # nowhere to propagate to anyway.
+        logger.propagate = False
+
     return logger

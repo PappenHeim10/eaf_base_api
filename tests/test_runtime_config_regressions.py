@@ -7,6 +7,7 @@ from curl_cffi.requests import AsyncSession
 
 import base_api.base as base_module
 from base_api.base import BaseCore
+from base_api.models import MediaSource
 from base_api.modules.config import DownloadConfigHLS, RuntimeConfig
 
 
@@ -109,7 +110,10 @@ async def test_hls_download_uses_the_cores_runtime_configuration(
     monkeypatch.setattr(core, "threaded_download", threaded_download)
     download_configuration = DownloadConfigHLS(
         quality="best",
-        m3u8_base_url="https://example.test/master.m3u8",
+        media_source=MediaSource(
+            url="https://example.test/master.m3u8",
+            source_type="HLS",
+        ),
     )
 
     result = await core.download(download_configuration)

@@ -6,7 +6,12 @@ import unicodedata
 from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import PurePath
-from .type_hints import DownloadState
+from .type_hints import (
+    DownloadState,
+    ProgressiveDownloadState,
+    PROGRESSIVE_STATE_KIND,
+    PROGRESSIVE_STATE_VERSION,
+)
 from datetime import timezone, datetime
 from curl_cffi.requests import Response
 from typing import Dict, Any, cast, List, Callable, Literal, Union
@@ -378,7 +383,7 @@ def load_segment_state(state_path: str) -> Dict[str, Any]:
 
 def build_segment_state(
     *,
-    segments: List[str],
+    segments: List[Any],
     missing: List[int],
     segment_dir: str | None,
     segment_index_width: int,
@@ -386,11 +391,12 @@ def build_segment_state(
     quality: str,
     start_segment: int,
     m3u8_url: str | None,
-    created_at: str | None = None
+    created_at: str | None = None,
+    version: int = 1
 ) -> DownloadState:
     now = datetime.now(timezone.utc).isoformat()
     state = DownloadState(
-        version=1,
+        version=version,
         created_at=created_at or now,
         updated_at=None,
         m3u8_url=m3u8_url,
@@ -404,6 +410,164 @@ def build_segment_state(
         segments=segments
     )
     return state
+
+
+# --- progressive HTTP transport ------------------------------------------------
+
+#: `bytes <first>-<last>/<complete>` or `bytes <first>-<last>/*`. Only the
+#: satisfied form; the unsatisfied `bytes */<complete>` form of a 416 is parsed
+#: by `parse_unsatisfied_content_range` below, because the two answer different
+#: questions and must never be confused for one another.
+_CONTENT_RANGE = re.compile(
+    r"\A\s*bytes\s+(?P<first>\d+)\s*-\s*(?P<last>\d+)\s*/\s*(?P<total>\d+|\*)\s*\Z",
+    re.IGNORECASE,
+)
+
+_UNSATISFIED_CONTENT_RANGE = re.compile(
+    r"\A\s*bytes\s+\*\s*/\s*(?P<total>\d+)\s*\Z", re.IGNORECASE
+)
+
+
+def parse_content_range(value: Any) -> tuple[int, int, int | None] | None:
+    """Parse a satisfied `Content-Range` into `(first, last, complete)`.
+
+    Returns `None` for anything this engine will not act on - a missing header,
+    a different unit, a malformed value, or a range whose end precedes its
+    start. `complete` is `None` for the `/*` form, which states the range but
+    not the resource's total size.
+
+    Unparsable is deliberately not "assume it is fine": a resumed download
+    appends to a real file, so a range it cannot verify is a range it must not
+    trust.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _CONTENT_RANGE.match(value)
+    if match is None:
+        return None
+    first = int(match.group("first"))
+    last = int(match.group("last"))
+    if last < first:
+        return None
+    raw_total = match.group("total")
+    total = None if raw_total == "*" else int(raw_total)
+    if total is not None and last >= total:
+        return None
+    return first, last, total
+
+
+def parse_unsatisfied_content_range(value: Any) -> int | None:
+    """Parse the `bytes */<complete>` form a 416 answers with.
+
+    This is the one piece of information that turns a 416 from "start over"
+    into "the local file may already be the whole thing": it is the resource's
+    total size, stated by a server that just refused the range asked for.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _UNSATISFIED_CONTENT_RANGE.match(value)
+    return int(match.group("total")) if match else None
+
+
+def normalize_etag(value: Any) -> tuple[str | None, bool]:
+    """Split an `ETag` header into `(entity_tag, is_weak)`.
+
+    The returned tag keeps its quotes, because an entity tag is compared as the
+    opaque string the server sent - `"abc"` and `abc` are not the same tag.
+    The weak flag is what decides whether it may ever appear in `If-Range`:
+    RFC 9110 allows only a strong validator there, and a weak one silently
+    turns a range request into a wrong answer on servers that accept it anyway.
+    """
+    if not isinstance(value, str):
+        return None, False
+    tag = value.strip()
+    if not tag:
+        return None, False
+    weak = tag[:2].upper() == "W/"
+    if weak:
+        tag = tag[2:].strip()
+        if not tag:
+            return None, False
+    return tag, weak
+
+
+def build_progressive_state(
+    *,
+    url: str,
+    output_path: str,
+    temp_path: str,
+    total_size: int | None,
+    downloaded_bytes: int,
+    etag: str | None,
+    etag_weak: bool,
+    last_modified: str | None,
+    created_at: str | None = None,
+) -> ProgressiveDownloadState:
+    now = datetime.now(timezone.utc).isoformat()
+    return ProgressiveDownloadState(
+        version=PROGRESSIVE_STATE_VERSION,
+        kind=PROGRESSIVE_STATE_KIND,
+        created_at=created_at or now,
+        updated_at=now,
+        url=url,
+        output_path=output_path,
+        temp_path=temp_path,
+        total_size=total_size,
+        downloaded_bytes=downloaded_bytes,
+        etag=etag,
+        etag_weak=etag_weak,
+        last_modified=last_modified,
+    )
+
+
+def write_progressive_state(state_path: str, state: ProgressiveDownloadState) -> None:
+    """Persist a resume state crash-safely: full temp file, then atomic replace.
+
+    A half-written state is worse than none at all, because the reader would
+    take its byte count as truth about a real file. `os.replace` is atomic on
+    every platform this runs on, so a crash leaves either the previous state or
+    the new one - never a torn one.
+    """
+    tmp_path = f"{state_path}.tmp"
+    payload = asdict(state)
+    for path_key in ("output_path", "temp_path"):
+        if isinstance(payload[path_key], PurePath):
+            payload[path_key] = str(payload[path_key])
+    with open(tmp_path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=True, indent=2, sort_keys=True)
+    os.replace(tmp_path, state_path)
+
+
+def load_progressive_state(state_path: str) -> Dict[str, Any] | None:
+    """Read a progressive resume state, or `None` if it is not ours to read.
+
+    `None` rather than an exception for every "cannot use this" case: an HLS
+    state file, a future schema version, a truncated file and a missing one all
+    mean the same thing to the caller - start at byte zero. Only the schema is
+    checked here; whether the state still matches the *file* on disk is decided
+    against that file, not against the state.
+    """
+    try:
+        with open(state_path, "r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("kind") != PROGRESSIVE_STATE_KIND:
+        return None
+    try:
+        version = int(payload.get("version"))
+    except (TypeError, ValueError):
+        return None
+    if version != PROGRESSIVE_STATE_VERSION:
+        return None
+    if not isinstance(payload.get("url"), str) or not payload["url"]:
+        return None
+    return cast(Dict[str, Any], payload)
 
 
 def truncate(name: str, max_bytes: int = 245) -> str:  # only 245, because we need to append .mp4
@@ -535,12 +699,18 @@ def log_precondition_failed(logger, response: Response, attempt: int) -> None:
 
 
 def strip_title(
-    title: str, max_length: int = 255, default_name: str = "untitled"
+    title: str,
+    max_length: int = 255,
+    default_name: str = "untitled",
+    max_bytes: int = 245,
 ) -> str:
     """Sanitize a filename to be safe across Windows, macOS, Linux, and Android.
 
     Prevents path traversal, replaces illegal characters, handles Windows reserved
-    names, and trims to a safe length.
+    names, and trims to a safe length in both characters and encoded bytes.
+
+    ``max_bytes`` defaults to 245 to leave room for the extension the caller
+    appends (see :func:`truncate`).
     """
     if not title:
         return default_name
@@ -575,8 +745,12 @@ def strip_title(
     if name_only in reserved_names:
         sanitized = f"_{sanitized}"
 
-    # 7. Trim to max length, then re-strip trailing dots/spaces in case the slice cut mid-string
-    sanitized = sanitized[:max_length].rstrip(" .")
+    # 7. Trim to the character limit AND to the byte limit, then re-strip trailing
+    # dots/spaces in case a cut landed mid-string.
+    # The byte limit matters because filesystems cap the *encoded* name, not the
+    # character count: ext4 and Android allow 255 bytes, so 255 CJK characters are
+    # roughly three times over the limit even though they pass `max_length`.
+    sanitized = truncate(sanitized[:max_length], max_bytes=max_bytes).rstrip(" .")
 
     # 8. Return default fallback if sanitization leaves an empty string
     return sanitized if sanitized else default_name

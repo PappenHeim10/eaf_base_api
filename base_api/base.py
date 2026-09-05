@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 import os
 import time
+import random
 import hashlib
 import string
 import shutil
@@ -13,7 +14,7 @@ import threading
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from enum import StrEnum
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from dataclasses import MISSING, dataclass, field, fields
 from curl_cffi import CurlOpt # Used for DNS over HTTPS
 from curl_cffi.requests.errors import RequestsError
@@ -36,9 +37,15 @@ from base_api.modules.static_functions import (
     load_segment_state, parse_retry_after, log_precondition_failed,
     write_segment_state, build_segment_state, segment_file_path,
     parse_challenge, other_challenge, least_factors, available_qualities,
-    choose_variant, collect_variants, get_segment_index_width
+    choose_variant, collect_variants, get_segment_index_width,
+    build_progressive_state, load_progressive_state, normalize_etag,
+    parse_content_range, parse_unsatisfied_content_range, write_progressive_state,
 )
-from base_api.modules.config import config, RuntimeConfig, DownloadConfigHLS, DownloadConfigRAW, IteratorConfig
+from base_api.modules.config import (
+    config, RuntimeConfig, DownloadConfigHLS, DownloadConfigHTTP,
+    DownloadConfigRAW, IteratorConfig,
+)
+from base_api.models import HLSSegment
 from base_api.modules.progress_bars import Callback
 from base_api.modules.logger import configure_app_logging
 
@@ -1562,6 +1569,56 @@ class Helper(Generic[MediaT]):
             ) from handler_error
 
 
+class ProgressiveAction(StrEnum):
+    """What one attempt of a progressive download tells its orchestrator to do.
+
+    Terminal failures are raised, not returned - the caller has to be able to
+    tell "this download is over" from "this attempt is over". These four are
+    the outcomes that leave the download itself still alive.
+    """
+
+    #: The body was streamed to its end. The file still has to pass the size
+    #: check before it is moved into place.
+    COMPLETED = "completed"
+    #: A 416 whose stated total matches the temporary file exactly: the bytes
+    #: are already all of them, and only the finalization is missing.
+    ALREADY_COMPLETE = "already_complete"
+    #: The remote resource cannot be reconciled with the local partial file.
+    #: Recovered by discarding both and starting at byte zero, exactly once.
+    RESTART = "restart"
+    #: Transient: retry the same offset after a backoff.
+    RETRY = "retry"
+    #: The stop event fired.
+    CANCELLED = "cancelled"
+
+
+@dataclass(slots=True)
+class ProgressiveOutcome:
+    """One attempt's result, including everything a resume needs to survive it.
+
+    The validators travel back with the outcome so that a connection that dies
+    mid-body still teaches the resume state which resource those bytes came
+    from - without that, the next run has bytes it cannot vouch for.
+    """
+
+    action: ProgressiveAction
+    written: int = 0
+    total: int | None = None
+    etag: str | None = None
+    etag_weak: bool = False
+    last_modified: str | None = None
+    retry_after: float | None = None
+    reason: str = ""
+
+    @property
+    def validators(self) -> Dict[str, Any]:
+        return {
+            "etag": self.etag,
+            "etag_weak": self.etag_weak,
+            "last_modified": self.last_modified,
+        }
+
+
 class BaseCore:
     """
     The base class which has all necessary functions for other API packages
@@ -1680,7 +1737,8 @@ class BaseCore:
     def _merged_headers(self, override: Dict[str, str] | None) -> Dict[str, Any]:
         """
         Create request headers from current session headers + optional overrides.
-        Overrides win, session headers are the base.
+        Overrides win, session headers are the base. The session itself is never
+        modified here - an override exists for exactly one request.
         """
         if self.session is None:
             self.initialize_session()
@@ -1688,7 +1746,15 @@ class BaseCore:
         assert session is not None
         headers: Dict[str, Any] = cast(Dict[str, Any], cast(Any, dict(session.headers)))
         if override:
-            headers.update(override)
+            for key, value in override.items():
+                # HTTP header names are case-insensitive, but the session stores
+                # its keys lowercased while callers write "Referer". A plain
+                # dict.update would keep both spellings and put two lines on the
+                # wire; replace case-insensitively so the override really wins.
+                lower = key.lower()
+                for existing in [k for k in headers if k.lower() == lower]:
+                    del headers[existing]
+                headers[key] = value
         return headers
 
     def _merged_cookies(self, override: Dict[str, str] | None) -> Dict[str, Any]:
@@ -2091,6 +2157,7 @@ class BaseCore:
             self,
             m3u8_url: str,
             quality: str | int,
+            headers: Dict[str, str] | None = None,
     ) -> str:
         """
         Return the media-playlist URL for the requested quality.
@@ -2148,7 +2215,8 @@ class BaseCore:
 
         else:
             content = await self.fetch_text(
-                url=m3u8_url
+                url=m3u8_url,
+                headers=headers,
             )
 
             master = m3u8.loads(content)
@@ -2240,8 +2308,38 @@ class BaseCore:
 
         return available_qualities(collect_variants(master))
 
-    async def get_segments(self, m3u8_url_master: str, quality: Union[str, int]) -> List[str]:
+    @staticmethod
+    def _parse_byterange(value: Any) -> tuple[int, int | None]:
+        """Parse an HLS BYTERANGE value: "<length>[@<offset>]".
+
+        Returns (length, offset); offset is None when the playlist omitted it,
+        which means "continues the previous sub-range" for media segments and
+        "start of the resource" for an EXT-X-MAP.
+        """
+        text = str(value).strip()
+        length_part, sep, offset_part = text.partition("@")
+        try:
+            length = int(length_part)
+            offset = int(offset_part) if sep else None
+        except ValueError as error:
+            raise PlaylistExtractionError(f"Invalid BYTERANGE value: {value!r}") from error
+        if length <= 0 or (offset is not None and offset < 0):
+            raise PlaylistExtractionError(f"Invalid BYTERANGE value: {value!r}")
+        return length, offset
+
+    async def get_segments(self, source: Any, quality: Union[str, int]) -> List[Any]:
         assert m3u8 is not None
+        
+        if getattr(source, "source_type", None) != "HLS":
+            from base_api.modules.errors import UnsupportedProtocolError
+            raise UnsupportedProtocolError(f"Unsupported source type: {getattr(source, 'source_type', 'None')}")
+            
+        m3u8_url_master = getattr(source, "url", "")
+        # The source's own transport contract. Sent with every request that
+        # belongs to this source; a source without one behaves exactly as before.
+        raw_headers = getattr(source, "headers", None)
+        source_headers: Dict[str, str] | None = dict(raw_headers) if raw_headers else None
+
         segment_cache_key = SegmentCacheKey(m3u8_url_master, str(quality))
         _segments = self.cache.get_segments(segment_cache_key)
         if _segments is not None:
@@ -2249,12 +2347,14 @@ class BaseCore:
             return _segments
 
         # Resolve the quality-specific playlist URL (may still be a master in some edge cases)
-        playlist_url = await self.get_m3u8_by_quality(m3u8_url=m3u8_url_master, quality=quality)
+        playlist_url = await self.get_m3u8_by_quality(
+            m3u8_url=m3u8_url_master, quality=quality, headers=source_headers
+        )
         self.logger.debug("Trying to fetch segments from m3u8 -> %s", playlist_url)
 
         # M3U8s are volatile → don't cache
         content = await self.fetch_text(
-            url=playlist_url, cache_policy=CachePolicy.BYPASS
+            url=playlist_url, cache_policy=CachePolicy.BYPASS, headers=source_headers
         )
         parsed = m3u8.loads(content)
 
@@ -2267,21 +2367,23 @@ class BaseCore:
             media_url = urljoin(playlist_url, media_rel)
             self.logger.info("Resolved to new URL: %s", media_url)
             content = await self.fetch_text(
-                url=media_url, cache_policy=CachePolicy.BYPASS
+                url=media_url, cache_policy=CachePolicy.BYPASS, headers=source_headers
             )
             parsed = m3u8.loads(content)
             base_url = media_url
 
-        segments: List[str] = []
+        specs: List[HLSSegment] = []
 
         # Robust init segment handling (EXT-X-MAP)
         # Older m3u8 lib: .segment_map; newer: .init_section
         init_url = None
+        init_byterange = None
         segments_map = getattr(parsed, "segment_map", None)
         if segments_map:
             assert isinstance(segments_map, list)
             try:
                 init_url = urljoin(base_url, segments_map[0].uri)
+                init_byterange = getattr(segments_map[0], "byterange", None)
             except Exception as exc:
                 self.logger.info("Couldn't get init url, this is probably not an issue: %s", exc)
                 pass
@@ -2289,19 +2391,54 @@ class BaseCore:
             init_section = getattr(parsed, "init_section", None)
             if init_section and getattr(init_section, "uri", None):
                 init_url = urljoin(base_url, init_section.uri)
+                init_byterange = getattr(init_section, "byterange", None)
 
         if init_url:
-            segments.append(init_url)
+            if init_byterange:
+                # RFC 8216 4.3.2.5: an EXT-X-MAP BYTERANGE without @offset
+                # starts at the beginning of the resource.
+                length, offset = self._parse_byterange(init_byterange)
+                specs.append(HLSSegment(url=init_url, length=length, offset=offset or 0))
+            else:
+                specs.append(HLSSegment(url=init_url))
             self.logger.debug("Found init segment: %s", init_url)
 
-        # Build absolute URLs for all media segments
+        # Build absolute URLs for all media segments, carrying byte ranges.
+        # RFC 8216 4.3.2.2: EXT-X-BYTERANGE without @offset continues directly
+        # after the previous media segment's sub-range of the same resource;
+        # without such a predecessor the playlist is invalid.
+        next_offset: Dict[str, int] = {}
         for seg in parsed.segments:
-            segments.append(urljoin(base_url, seg.uri))
+            seg_url = urljoin(base_url, seg.uri)
+            byterange = getattr(seg, "byterange", None)
+            if byterange:
+                length, offset = self._parse_byterange(byterange)
+                if offset is None:
+                    if seg_url not in next_offset:
+                        raise PlaylistExtractionError(
+                            f"EXT-X-BYTERANGE without offset has no preceding sub-range of {seg_url}"
+                        )
+                    offset = next_offset[seg_url]
+                specs.append(HLSSegment(url=seg_url, length=length, offset=offset))
+                next_offset[seg_url] = offset + length
+            else:
+                specs.append(HLSSegment(url=seg_url))
 
-        self.logger.debug("Fetched %s segments from m3u8 URL (including init if present)", len(segments))
+        ranged = any(spec.has_range for spec in specs)
+        self.logger.debug(
+            "Fetched %s segments from m3u8 URL (including init if present, byte-ranged=%s)",
+            len(specs), ranged,
+        )
+        if ranged:
+            # Ranged playlists are not cached: the segment cache stores plain
+            # URL strings, and a range dropped on the way through it would turn
+            # every fragment back into a full-file download.
+            return cast(List[Any], specs)
+
+        segments = [spec.url for spec in specs]
         self.logger.info("Saving segments to cache....")
         self.cache.set_segments(segment_cache_key, segments)
-        return segments
+        return cast(List[Any], segments)
 
 
     def _safe_remove(self, path: str | None) -> None:
@@ -2325,16 +2462,45 @@ class BaseCore:
             self.logger.debug("Failed to remove directory %s: %s", path, e)
 
     async def download_segment(self, url: str, timeout: int, stop_event:
-                                asyncio.Event | None = None) -> tuple[str, bytes, bool]:
+                                asyncio.Event | None = None,
+                                headers: Dict[str, str] | None = None,
+                                byte_range: tuple[int, int] | None = None) -> tuple[str, bytes, bool]:
         """
-        Attempt to download a single segment.
+        Attempt to download a single segment, optionally a byte range of it.
+
+        `byte_range` is (offset, length) from the playlist and becomes the
+        request's `Range: bytes=<offset>-<offset+length-1>`. The header is
+        request-local: it is merged with the source's own headers into a fresh
+        dict, never written back into them, and never onto the session. The
+        playlist-computed range wins over any Range a caller put into the
+        source headers - the playlist is the contract for what this segment is.
         Returns (url, content, success).
         """
         try:
             if stop_event is not None and stop_event.is_set():
                 return url, b"", False # Stopping the download here
 
-            content = await self.fetch_bytes(url, timeout=timeout)
+            request_headers: Dict[str, str] | None = headers
+            if byte_range is not None:
+                offset, length = byte_range
+                request_headers = {
+                    key: value for key, value in (headers or {}).items()
+                    if key.lower() != "range"
+                }
+                request_headers["Range"] = f"bytes={offset}-{offset + length - 1}"
+
+            content = await self.fetch_bytes(url, timeout=timeout, headers=request_headers)
+
+            if byte_range is not None and len(content) != byte_range[1]:
+                # A server that ignores Range answers 200 with the whole
+                # resource; concatenating that once per fragment would corrupt
+                # the output. Wrong-sized payloads are failures, not data.
+                self.logger.warning(
+                    "Range request for %s returned %s bytes instead of %s (%s)",
+                    url, len(content), byte_range[1], request_headers.get("Range") if request_headers else None,
+                )
+                return url, b"", False
+
             return url, content, True
         except Exception as e:
             # Log and mark failure; the caller will decide whether to retry or abort.
@@ -2343,12 +2509,19 @@ class BaseCore:
 
     async def download(
         self,
-        configuration: DownloadConfigHLS
+        configuration: DownloadConfigHLS | DownloadConfigHTTP
     ) -> DownloadReport | bool:
-        """
-        :param video:
-        :param configuration:
-        :return:
+        """Download one media source; the configuration's type picks the transport.
+
+        `DownloadConfigHLS` takes the segmented playlist path, `DownloadConfigHTTP`
+        the progressive single-stream one. The transport is never inferred from
+        the URL, the file extension or the response's content type: a caller
+        that built an HLS configuration gets the HLS engine even if the URL ends
+        in `.mp4`, and a configuration this engine has no transport for is an
+        error rather than a silent fallback onto the wrong one.
+
+        :param configuration: the transport-specific download configuration
+        :return: a DownloadReport when one was requested, else a bool
         """
 
         if configuration.callback is None:
@@ -2356,7 +2529,25 @@ class BaseCore:
             configuration.callback = Callback.text_progress_bar
             self.logger.debug("download: no callback provided, using default text progress bar")
 
-        m3u8_url = configuration.m3u8_base_url
+        if isinstance(configuration, DownloadConfigHTTP):
+            return await self.progressive_download(configuration)
+
+        if not isinstance(configuration, DownloadConfigHLS):
+            raise TypeError(
+                "BaseCore.download() takes a DownloadConfigHLS or a DownloadConfigHTTP, "
+                f"got {type(configuration).__name__}"
+            )
+
+        media_source = configuration.media_source
+        if media_source is None:
+            from base_api.modules.errors import MediaSourceError
+            raise MediaSourceError("No media source provided.")
+            
+        if getattr(media_source, "source_type", None) != "HLS":
+            from base_api.modules.errors import UnsupportedProtocolError
+            raise UnsupportedProtocolError(f"Unsupported source type: {getattr(media_source, 'source_type', 'None')}")
+
+        m3u8_url = getattr(media_source, "url", "")
 
         if inspect.iscoroutinefunction(m3u8_url) or (callable(m3u8_url) and not isinstance(m3u8_url, str)):
             m3u8_url = m3u8_url()
@@ -2364,7 +2555,7 @@ class BaseCore:
             m3u8_url = await m3u8_url
 
         if m3u8_url:
-            self.logger.debug("Download m3u8_base_url=%s", m3u8_url)
+            self.logger.debug("Download media_source.url=%s", m3u8_url)
 
         self.logger.debug("download: dispatching to threaded downloader (timeout=%s)", self.configuration.timeout)
 
@@ -2375,6 +2566,825 @@ class BaseCore:
             timeout=self.configuration.timeout,
             max_workers=self.configuration.max_workers_download,
         )
+
+    # --- progressive HTTP transport -------------------------------------------
+    #
+    # One media file, one stream, resumable by byte offset. Deliberately not a
+    # degenerate case of the HLS engine: there is no playlist to re-resolve, no
+    # segment directory to reconcile, and the unit of progress is a byte rather
+    # than a fragment - so the resume contract, the failure classification and
+    # the cleanup rules are all different ones.
+
+    #: The only schemes this transport fetches. Checked on the source URL and
+    #: again on every redirect target.
+    _PROGRESSIVE_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https"})
+    #: A redirect chain is remote input; without a bound it is a denial of
+    #: service against ourselves.
+    _PROGRESSIVE_MAX_REDIRECTS: ClassVar[int] = 5
+    _PROGRESSIVE_REDIRECT_STATUS: ClassVar[frozenset[int]] = frozenset({301, 302, 303, 307, 308})
+    #: Worth another attempt at the same offset. 5xx is handled alongside these.
+    _PROGRESSIVE_TRANSIENT_STATUS: ClassVar[frozenset[int]] = frozenset({408, 425, 429})
+
+    @classmethod
+    def _validate_progressive_url(cls, url: Any) -> str:
+        """Return `url` iff this transport is allowed to fetch it.
+
+        Applied to the source's own URL and again to every redirect target,
+        because a redirect is a destination chosen by a remote party: a chain
+        that starts at https and ends at a `file://` URL or at one carrying
+        credentials has to be refused at the hop that introduces it.
+
+        Private and link-local address ranges are deliberately *not* filtered
+        here - that is a separate decision with its own failure modes (split
+        DNS, self-hosted instances on a LAN) and is not part of this transport.
+        """
+        if not isinstance(url, str) or not url.strip():
+            raise MediaSourceError("A progressive download needs a URL.")
+
+        candidate = url.strip()
+        try:
+            parts = urlsplit(candidate)
+            scheme = (parts.scheme or "").lower()
+            username, password, hostname = parts.username, parts.password, parts.hostname
+        except ValueError as exc:
+            raise MediaSourceError(f"Unusable media URL: {exc}") from exc
+
+        if scheme not in cls._PROGRESSIVE_SCHEMES:
+            raise MediaSourceError(
+                f"Refusing to fetch scheme {scheme!r}; only http and https are downloaded."
+            )
+        # Userinfo turns the URL itself into a credential: it would be logged,
+        # written into the resume state and replayed on every retry and redirect.
+        if username is not None or password is not None:
+            raise MediaSourceError("Refusing a media URL that carries credentials in its userinfo.")
+        if not hostname:
+            raise MediaSourceError("Refusing a media URL without a host.")
+        return candidate
+
+    def _progressive_headers(
+        self,
+        source_headers: Dict[str, str] | None,
+        offset: int,
+        validators: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the headers for one progressive attempt. Request-local, always.
+
+        Session headers plus this source's own, exactly like every other media
+        request, and then the three headers this transport owns. The source's
+        dict is never written to, so two downloads running on one core cannot
+        pick up each other's Range.
+        """
+        headers = self._merged_headers(dict(source_headers) if source_headers else None)
+        # The transport owns these three; a source that carries its own is
+        # overruled rather than merged with, so the request cannot end up with
+        # two Ranges or with a compressed body.
+        for existing in [
+            key for key in headers if key.lower() in {"accept-encoding", "range", "if-range"}
+        ]:
+            del headers[existing]
+        # Identity encoding: a compressed body makes Content-Length describe the
+        # transfer instead of the resource, which would silently break both the
+        # resume offset and the completeness check.
+        headers["Accept-Encoding"] = "identity"
+
+        if offset > 0:
+            headers["Range"] = f"bytes={offset}-"
+            entity_tag = validators.get("etag")
+            if entity_tag and not validators.get("etag_weak"):
+                # Only a strong entity tag. RFC 9110 allows nothing else as a
+                # range precondition, and a weak one handed to a server that
+                # accepts it anyway produces a silently wrong file.
+                headers["If-Range"] = entity_tag
+        return headers
+
+    def _truncate_file(self, path: str, size: int) -> bool:
+        """Cut `path` back to `size` bytes. False means the file is now gone."""
+        if size <= 0:
+            self._safe_remove(path)
+            return False
+        try:
+            with open(path, "r+b") as handle:
+                handle.truncate(size)
+            return True
+        except OSError as exc:
+            self.logger.warning(
+                "Could not truncate %s to %s bytes (%s); discarding it.", path, size, exc
+            )
+            self._safe_remove(path)
+            return False
+
+    def _plan_progressive_resume(
+        self, state: Mapping[str, Any] | None, tmp_path: str
+    ) -> tuple[int, Dict[str, Any]]:
+        """Decide where to continue, with the temporary file as the truth.
+
+        The state records what the last run *believed* it had written; the file
+        records what actually reached the disk. They can disagree - a crash
+        between the two writes is the case the state file exists for - and the
+        only safe reconciliation is the smaller of the two, with the file cut
+        back to it so that the next byte written really is byte `offset`.
+        """
+        try:
+            tmp_size = os.path.getsize(tmp_path)
+        except OSError:
+            tmp_size = 0
+
+        if state is None:
+            # A temporary file with no state carries no validators, so nothing
+            # can establish that its bytes belong to the resource being fetched
+            # now. Appending to it would produce a file made of two videos.
+            if tmp_size:
+                self.logger.info(
+                    "Discarding a %s byte temporary file that has no resume state.", tmp_size
+                )
+            self._safe_remove(tmp_path)
+            return 0, {}
+
+        try:
+            recorded = int(state.get("downloaded_bytes") or 0)
+        except (TypeError, ValueError):
+            recorded = 0
+
+        offset = max(0, min(recorded, tmp_size))
+        if offset != tmp_size:
+            self.logger.warning(
+                "Resume state records %s bytes and the temporary file holds %s; continuing at %s.",
+                recorded, tmp_size, offset,
+            )
+            if not self._truncate_file(tmp_path, offset):
+                offset = 0
+
+        total = state.get("total_size")
+        return offset, {
+            "etag": state.get("etag"),
+            "etag_weak": bool(state.get("etag_weak")),
+            "last_modified": state.get("last_modified"),
+            "total": int(total) if isinstance(total, int) else None,
+        }
+
+    @staticmethod
+    def _progressive_validator_mismatch(
+        known: Mapping[str, Any],
+        *,
+        etag: str | None,
+        etag_weak: bool,
+        last_modified: str | None,
+        total: int | None,
+    ) -> str | None:
+        """Why a resumed answer is not the resource we started on, or None.
+
+        Compared here rather than delegated to `If-Range`, because a server that
+        mishandles `If-Range` answers 206 for a resource that changed - and the
+        result is a file assembled from two different videos that nothing
+        downstream detects. Anything that cannot be *confirmed* identical counts
+        as changed: a state that had a validator and an answer that has none
+        means the only evidence we had is gone.
+
+        A weak ETag is compared for equality here even though it may never be
+        sent as a range precondition. Weak equality plus an unchanged total is
+        the strongest statement such a server offers; the alternative would be
+        to refuse every resume against it.
+        """
+        known_etag = known.get("etag")
+        if known_etag:
+            if not etag:
+                return "the response no longer carries an ETag"
+            if etag != known_etag or bool(known.get("etag_weak")) != etag_weak:
+                return "the ETag changed"
+
+        known_modified = known.get("last_modified")
+        if known_modified:
+            if not last_modified and not known_etag:
+                return "the response no longer carries Last-Modified"
+            if last_modified and last_modified != known_modified:
+                return "Last-Modified changed"
+
+        known_total = known.get("total")
+        if known_total is not None and total is not None and int(known_total) != int(total):
+            return f"the total size changed from {known_total} to {total}"
+        return None
+
+    @staticmethod
+    def _parse_content_length(value: Any) -> int | None:
+        try:
+            length = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return length if length >= 0 else None
+
+    def _progressive_backoff(self, attempt: int) -> float:
+        """The same bounded exponential backoff `request()` retries on."""
+        settings = self.configuration
+        delay = settings.request_retry_initial_delay * (
+            settings.request_multiplier ** max(0, attempt - 1)
+        )
+        return min(delay, settings.request_retry_max_delay) + random.uniform(
+            0.0, settings.request_retry_jitter
+        )
+
+    async def _sleep_unless_stopped(self, delay: float, stop_event: Any) -> bool:
+        """Wait `delay` seconds; True means the stop event fired first.
+
+        Backoff is where a cancelled download would otherwise sit for up to the
+        maximum retry delay before noticing, so the wait itself is cancellable.
+        Both event flavors work: `asyncio.Event.wait()` is awaited,
+        `threading.Event.wait(timeout)` is offloaded to a thread.
+        """
+        if stop_event is None:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return False
+        if stop_event.is_set():
+            return True
+        if delay <= 0:
+            return False
+
+        wait_method = getattr(stop_event, "wait", None)
+        if asyncio.iscoroutinefunction(wait_method):
+            try:
+                await asyncio.wait_for(stop_event.wait(), delay)
+                return True
+            except (asyncio.TimeoutError, TimeoutError):
+                return False
+        if wait_method is None:
+            await asyncio.sleep(delay)
+            return bool(stop_event.is_set())
+        return bool(await asyncio.to_thread(cast(Any, wait_method), delay))
+
+    async def _progressive_attempt(
+        self,
+        *,
+        url: str,
+        tmp_path: str,
+        offset: int,
+        validators: Mapping[str, Any],
+        expected_size: int | None,
+        chunk_size: int,
+        timeout: float,
+        stop_event: Any,
+        source_headers: Dict[str, str] | None,
+        on_progress: Callable[[int, int | None, Mapping[str, Any]], None],
+    ) -> ProgressiveOutcome:
+        """One request, its redirects, and as much of the body as it delivers.
+
+        Returns a `ProgressiveOutcome` for everything the download can survive
+        and raises for everything it cannot: a terminal status, an oversized
+        body, a filesystem failure. The body is never materialized - it is
+        streamed and written in bounded pieces, so a 4 GB file costs a chunk of
+        memory rather than 4 GB of it.
+        """
+        if self.session is None:
+            self.initialize_session()
+        session = self.session
+        assert session is not None
+
+        current_url = url
+        redirects = 0
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return ProgressiveOutcome(action=ProgressiveAction.CANCELLED, written=offset)
+
+            headers = self._progressive_headers(source_headers, offset, validators)
+            cookies = self._merged_cookies(None)
+            await self.enforce_delay()
+            self.total_requests += 1
+            self.logger.debug(
+                "Progressive GET %s offset=%s header_names=%s",
+                current_url, offset, sorted(headers),
+            )
+
+            async with cast(Any, session).stream(
+                "GET",
+                current_url,
+                headers=headers,
+                cookies=cookies,
+                timeout=timeout,
+                allow_redirects=False,
+                accept_encoding="identity",
+            ) as response:
+                status = int(response.status_code)
+
+                if status in self._PROGRESSIVE_REDIRECT_STATUS:
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise HTTPStatusError(
+                            f"HTTP {status} without a Location header for {current_url}",
+                            status_code=status,
+                            url=current_url,
+                        )
+                    redirects += 1
+                    if redirects > self._PROGRESSIVE_MAX_REDIRECTS:
+                        raise HTTPStatusError(
+                            f"More than {self._PROGRESSIVE_MAX_REDIRECTS} redirects starting at {url}",
+                            status_code=status,
+                            url=current_url,
+                        )
+                    # Validated again: the previous hop's approval says nothing
+                    # about where this one points.
+                    current_url = self._validate_progressive_url(urljoin(current_url, location))
+                    self.logger.debug("Progressive redirect %s -> %s", status, current_url)
+                    continue
+
+                if status == 429:
+                    retry_after = parse_retry_after(logger=self.logger, response=response)
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RETRY,
+                        written=offset,
+                        retry_after=retry_after,
+                        reason="HTTP 429 rate limited",
+                    )
+
+                if status in self._PROGRESSIVE_TRANSIENT_STATUS or 500 <= status < 600:
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RETRY, written=offset, reason=f"HTTP {status}"
+                    )
+
+                if status == 416:
+                    # The one status whose recovery depends on the local file: a
+                    # server refusing our range while stating the resource's size
+                    # may just be telling us we already have all of it.
+                    stated_total = parse_unsatisfied_content_range(
+                        response.headers.get("Content-Range")
+                    )
+                    try:
+                        local_size = os.path.getsize(tmp_path)
+                    except OSError:
+                        local_size = 0
+                    if stated_total is not None and local_size > 0 and stated_total == local_size:
+                        entity_tag, tag_is_weak = normalize_etag(response.headers.get("ETag"))
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.ALREADY_COMPLETE,
+                            written=local_size,
+                            total=stated_total,
+                            etag=entity_tag,
+                            etag_weak=tag_is_weak,
+                            last_modified=response.headers.get("Last-Modified"),
+                            reason="HTTP 416 states the local file is already the whole resource",
+                        )
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RESTART,
+                        reason=f"HTTP 416 (stated total {stated_total}, local file {local_size} bytes)",
+                    )
+
+                if status == 412:
+                    # A precondition we set was rejected, so the resource is not
+                    # the one the local bytes came from. Not logged through
+                    # `log_precondition_failed`: that helper previews the body,
+                    # and this response's body is a stream we must not consume.
+                    return ProgressiveOutcome(
+                        action=ProgressiveAction.RESTART, reason="HTTP 412 precondition failed"
+                    )
+
+                if status in {401, 403}:
+                    raise AccessDeniedError(
+                        f"Request blocked by server (HTTP {status}) for {current_url}"
+                    )
+                if status == 410:
+                    raise ResourceGone(f"Resource gone (HTTP 410) for URL: {current_url}")
+                if status not in {200, 206}:
+                    raise HTTPStatusError(
+                        f"HTTP {status} for {current_url}", status_code=status, url=current_url
+                    )
+
+                entity_tag, tag_is_weak = normalize_etag(response.headers.get("ETag"))
+                last_modified = response.headers.get("Last-Modified")
+                meta: Dict[str, Any] = {
+                    "etag": entity_tag,
+                    "etag_weak": tag_is_weak,
+                    "last_modified": last_modified,
+                }
+
+                if status == 206:
+                    if offset <= 0:
+                        # We asked for the whole resource. A partial answer has
+                        # no place we could put it.
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RESTART,
+                            reason="HTTP 206 for a request that carried no Range",
+                        )
+                    parsed = parse_content_range(response.headers.get("Content-Range"))
+                    if parsed is None:
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RESTART,
+                            reason=(
+                                "HTTP 206 without a parsable Content-Range "
+                                f"({response.headers.get('Content-Range')!r})"
+                            ),
+                        )
+                    first, _last, complete = parsed
+                    if first != offset:
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RESTART,
+                            reason=f"HTTP 206 starts at byte {first}, expected {offset}",
+                        )
+                    mismatch = self._progressive_validator_mismatch(
+                        validators,
+                        etag=entity_tag,
+                        etag_weak=tag_is_weak,
+                        last_modified=last_modified,
+                        total=complete,
+                    )
+                    if mismatch is not None:
+                        return ProgressiveOutcome(action=ProgressiveAction.RESTART, reason=mismatch)
+                    write_offset = offset
+                    total = complete if complete is not None else expected_size
+                else:
+                    # HTTP 200: either we never asked for a range, or the server
+                    # ignored the one we sent. Both mean this body is the whole
+                    # resource, so the file is rewritten from byte zero -
+                    # appending would splice a second copy onto the first.
+                    if offset > 0:
+                        self.logger.warning(
+                            "Server answered 200 to a Range request for %s; "
+                            "rewriting the file from byte zero.",
+                            current_url,
+                        )
+                    write_offset = 0
+                    body_length = self._parse_content_length(response.headers.get("Content-Length"))
+                    total = body_length if body_length is not None else expected_size
+
+                if write_offset and not os.path.exists(tmp_path):
+                    # Nothing to append to after all; the resource is fetched whole.
+                    self.logger.warning(
+                        "The temporary file for %s vanished before the body arrived; "
+                        "writing from byte zero.",
+                        current_url,
+                    )
+                    write_offset = 0
+
+                if (
+                    total is not None
+                    and expected_size is not None
+                    and int(total) != int(expected_size)
+                ):
+                    self.logger.warning(
+                        "The provider stated %s bytes for %s but the response states %s; "
+                        "the response wins for this body.",
+                        expected_size, current_url, total,
+                    )
+
+                written = write_offset
+                on_progress(written, total, meta)
+
+                handle = open(tmp_path, "wb" if write_offset == 0 else "r+b")
+                try:
+                    if write_offset:
+                        handle.seek(write_offset)
+                        handle.truncate()
+
+                    buffer = bytearray()
+
+                    async def flush(piece: bytes) -> None:
+                        nonlocal written
+                        await asyncio.to_thread(handle.write, piece)
+                        written += len(piece)
+                        if total is not None and written > total:
+                            raise OversizedBody(
+                                f"{current_url} sent more than the {total} bytes it stated",
+                                written=written,
+                                expected=int(total),
+                            )
+                        on_progress(written, total, meta)
+
+                    try:
+                        async for raw_chunk in response.aiter_content():
+                            if stop_event is not None and stop_event.is_set():
+                                return ProgressiveOutcome(
+                                    action=ProgressiveAction.CANCELLED,
+                                    written=written,
+                                    total=total,
+                                    **meta,
+                                )
+                            if raw_chunk:
+                                buffer += raw_chunk
+                            # curl decides how much it hands us; the write size,
+                            # the progress granularity and the oversize check are
+                            # ours, so the stream is re-cut to `chunk_size`.
+                            while len(buffer) >= chunk_size:
+                                # Checked per written chunk, not only per chunk
+                                # curl delivers: one curl chunk can be the whole
+                                # small file, and a stop must not have to wait
+                                # for the next network read to be noticed.
+                                if stop_event is not None and stop_event.is_set():
+                                    return ProgressiveOutcome(
+                                        action=ProgressiveAction.CANCELLED,
+                                        written=written,
+                                        total=total,
+                                        **meta,
+                                    )
+                                piece = bytes(buffer[:chunk_size])
+                                del buffer[:chunk_size]
+                                await flush(piece)
+                        if buffer:
+                            if stop_event is not None and stop_event.is_set():
+                                return ProgressiveOutcome(
+                                    action=ProgressiveAction.CANCELLED,
+                                    written=written,
+                                    total=total,
+                                    **meta,
+                                )
+                            await flush(bytes(buffer))
+                    except (RequestsError, asyncio.TimeoutError, TimeoutError) as exc:
+                        # The connection died mid-body. Everything already
+                        # written is a valid prefix, so this is a retry at the
+                        # new offset - and the validators travel back with it so
+                        # the resume can prove those bytes still belong together.
+                        self.logger.warning(
+                            "Progressive stream for %s broke after %s bytes: %s",
+                            current_url, written, exc,
+                        )
+                        if buffer:
+                            # Bytes that arrived before the break are still a
+                            # valid prefix; discarding them would make the resume
+                            # re-fetch up to one chunk for no reason.
+                            await flush(bytes(buffer))
+                        return ProgressiveOutcome(
+                            action=ProgressiveAction.RETRY,
+                            written=written,
+                            total=total,
+                            reason=f"{type(exc).__name__}: {exc}",
+                            **meta,
+                        )
+                finally:
+                    handle.close()
+
+                return ProgressiveOutcome(
+                    action=ProgressiveAction.COMPLETED, written=written, total=total, **meta
+                )
+
+    async def progressive_download(self, configuration: DownloadConfigHTTP) -> bool:
+        """Download one progressive media file as a single resumable stream.
+
+        Sequential by design: one connection, one file, appended to. Parallel
+        multipart would need every part's server to agree on ranges *and* on the
+        resource staying byte-identical for the whole download, which is exactly
+        the assumption the resume contract below refuses to make.
+
+        Returns True when the file is complete and in place, False when the stop
+        event ended it. Every other failure raises a typed transport error the
+        caller can act on, rather than a bare False that says only "something".
+        """
+        media_source = configuration.media_source
+        if media_source is None:
+            raise MediaSourceError("No media source provided.")
+        if getattr(media_source, "source_type", None) != "HTTP":
+            raise UnsupportedProtocolError(
+                "The progressive transport downloads HTTP sources, got "
+                f"{getattr(media_source, 'source_type', 'None')!r}"
+            )
+
+        source_url = self._validate_progressive_url(getattr(media_source, "url", None))
+        # The target file name is the caller's, always. Neither the URL's last
+        # path segment nor a Content-Disposition ever names a file here: both are
+        # remote input, and a download must not be able to choose where on the
+        # filesystem it lands.
+        target = str(configuration.path)
+        tmp_path = f"{target}.tmp"
+        state_path = configuration.state_path
+        callback = configuration.callback
+        stop_event = configuration.stop_event
+        chunk_size = max(1, int(configuration.chunk_size))
+        flush_bytes = max(chunk_size, int(configuration.state_flush_bytes))
+        timeout = float(
+            configuration.read_timeout
+            if configuration.read_timeout is not None
+            else self.configuration.timeout
+        )
+        max_attempts = max(
+            1,
+            int(
+                configuration.max_attempts
+                if configuration.max_attempts is not None
+                else self.configuration.request_attempts
+            ),
+        )
+        raw_headers = getattr(media_source, "headers", None)
+        source_headers: Dict[str, str] = dict(raw_headers) if raw_headers else {}
+        expected_size = configuration.expected_size
+        if expected_size is None:
+            expected_size = getattr(media_source, "expected_size", None)
+
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        self.logger.info(
+            "Progressive download start: path=%s state_path=%s expected_size=%s chunk_size=%s "
+            "max_attempts=%s timeout=%s header_names=%s",
+            target, state_path, expected_size, chunk_size, max_attempts, timeout,
+            sorted(source_headers),
+        )
+
+        state = load_progressive_state(state_path) if state_path else None
+        if state is not None and state.get("url") != source_url:
+            # A different URL means different bytes, whatever the file holds.
+            self.logger.info(
+                "Resume state at %s was written for another URL; starting fresh.", state_path
+            )
+            self._safe_remove(tmp_path)
+            self._safe_remove(state_path)
+            state = None
+
+        offset, validators = self._plan_progressive_resume(state, tmp_path)
+        if expected_size is None and validators.get("total") is not None:
+            expected_size = int(cast(int, validators["total"]))
+
+        state_created_at: str | None = cast(Any, state.get("created_at")) if state else None
+        last_persisted = offset
+
+        def persist(written: int, total: int | None, meta: Mapping[str, Any]) -> None:
+            """Write the resume state. Always after the bytes, never before.
+
+            A state ahead of the file would claim progress the file cannot back
+            up; a state behind it only costs the difference on the next run,
+            because the resume takes the smaller of the two.
+            """
+            nonlocal state_created_at, last_persisted
+            if not state_path:
+                return
+            record = build_progressive_state(
+                url=source_url,
+                output_path=target,
+                temp_path=tmp_path,
+                total_size=total,
+                downloaded_bytes=written,
+                etag=cast(Any, meta.get("etag")),
+                etag_weak=bool(meta.get("etag_weak")),
+                last_modified=cast(Any, meta.get("last_modified")),
+                created_at=state_created_at,
+            )
+            try:
+                write_progressive_state(state_path, record)
+            except OSError as exc:
+                self.logger.warning("Could not persist resume state %s: %s", state_path, exc)
+                return
+            state_created_at = cast(str, record.created_at)
+            last_persisted = written
+
+        def on_progress(written: int, total: int | None, meta: Mapping[str, Any]) -> None:
+            if callback is not None:
+                # An unknown total is reported as 0 rather than guessed at: a
+                # progress bar that invents a denominator lies about the end.
+                callback(written, int(total) if total else 0)
+            if state_path and written - last_persisted >= flush_bytes:
+                persist(written, total, meta)
+
+        def replan(written: int, total: int | None, meta: Mapping[str, Any]) -> None:
+            nonlocal offset, validators, expected_size
+            if total is not None:
+                expected_size = int(total)
+            offset, validators = self._plan_progressive_resume(
+                {
+                    "downloaded_bytes": written,
+                    "etag": meta.get("etag"),
+                    "etag_weak": meta.get("etag_weak"),
+                    "last_modified": meta.get("last_modified"),
+                    "total_size": total,
+                },
+                tmp_path,
+            )
+
+        def cancel(written: int, total: int | None, meta: Mapping[str, Any]) -> bool:
+            """An explicit stop. The partial file goes, unless asked otherwise."""
+            self.logger.warning(
+                "Progressive download cancelled after %s bytes (cleanup_on_stop=%s).",
+                written, configuration.cleanup_on_stop,
+            )
+            if configuration.cleanup_on_stop:
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+            else:
+                persist(written, total, meta)
+            return False
+
+        restarts = 0
+        attempts = 0
+        last_error: Exception | None = None
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return cancel(offset, expected_size, validators)
+
+            try:
+                outcome = await self._progressive_attempt(
+                    url=source_url,
+                    tmp_path=tmp_path,
+                    offset=offset,
+                    validators=validators,
+                    expected_size=expected_size,
+                    chunk_size=chunk_size,
+                    timeout=timeout,
+                    stop_event=stop_event,
+                    source_headers=source_headers,
+                    on_progress=on_progress,
+                )
+            except (RequestsError, asyncio.TimeoutError, TimeoutError) as exc:
+                # A failure before any response header arrived: nothing new was
+                # learned about the resource, so the current plan stands.
+                last_error = exc
+                outcome = ProgressiveOutcome(
+                    action=ProgressiveAction.RETRY,
+                    written=offset,
+                    total=expected_size,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    etag=cast(Any, validators.get("etag")),
+                    etag_weak=bool(validators.get("etag_weak")),
+                    last_modified=cast(Any, validators.get("last_modified")),
+                )
+            except OversizedBody:
+                # The bytes on disk contain data that is not the resource as
+                # described; unlike a short body this cannot be resumed from.
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+                raise
+
+            if outcome.action is ProgressiveAction.CANCELLED:
+                return cancel(outcome.written, outcome.total, outcome.validators)
+
+            if outcome.action is ProgressiveAction.RETRY:
+                if outcome.written > last_persisted:
+                    persist(outcome.written, outcome.total, outcome.validators)
+                attempts += 1
+                if attempts >= max_attempts:
+                    error = last_error or NetworkRequestError(outcome.reason or "transient failure")
+                    self.logger.error(
+                        "Progressive download of %s failed after %s attempts.", source_url, attempts
+                    )
+                    raise RequestRetriesExhausted(source_url, attempts, error)
+                delay = (
+                    outcome.retry_after
+                    if outcome.retry_after is not None
+                    else self._progressive_backoff(attempts)
+                )
+                self.logger.warning(
+                    "Progressive attempt %s/%s for %s failed (%s); retrying in %.2fs.",
+                    attempts, max_attempts, source_url, outcome.reason, delay,
+                )
+                if await self._sleep_unless_stopped(delay, stop_event):
+                    return cancel(outcome.written, outcome.total, outcome.validators)
+                replan(outcome.written, outcome.total, outcome.validators)
+                continue
+
+            if outcome.action is ProgressiveAction.RESTART:
+                if restarts >= 1:
+                    # One automatic restart, never two: a server that keeps
+                    # contradicting itself has to surface as an error rather than
+                    # re-downloading the same file forever.
+                    raise ResumeConflict(
+                        f"Resuming {source_url} failed again after a fresh start: {outcome.reason}"
+                    )
+                restarts += 1
+                self.logger.warning("Restarting %s at byte zero: %s", source_url, outcome.reason)
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+                offset, validators = 0, {}
+                last_persisted = 0
+                state_created_at = None
+                continue
+
+            # COMPLETED or ALREADY_COMPLETE. The file on disk decides, not the
+            # byte counter: the counter is what we think we wrote, the size is
+            # what is actually there to move into place.
+            total = outcome.total
+            try:
+                actual = os.path.getsize(tmp_path)
+            except OSError as exc:
+                raise UnknownError(
+                    f"The temporary file {tmp_path} disappeared before it could be finalized: {exc}"
+                ) from exc
+
+            if total is not None and actual < total:
+                # A valid prefix: keep it and its state so a later run continues.
+                persist(actual, total, outcome.validators)
+                raise IncompleteBody(
+                    f"{source_url} delivered {actual} of {total} bytes",
+                    written=actual,
+                    expected=int(total),
+                )
+            if total is not None and actual > total:
+                self._safe_remove(tmp_path)
+                self._safe_remove(state_path)
+                raise OversizedBody(
+                    f"{source_url} delivered {actual} bytes but stated {total}",
+                    written=actual,
+                    expected=int(total),
+                )
+
+            # No PyAV, no remux, no container inspection: a progressive MP4 is
+            # already the file the user asked for, and opening it would only add
+            # a way to fail after the bytes are correct.
+            self._replace_with_retry(tmp_path, target)
+            self._safe_remove(state_path)
+            if callback is not None:
+                # The total is known now even when the server never stated one:
+                # it is exactly what arrived.
+                callback(actual, int(total) if total is not None else actual)
+            self.logger.info(
+                "Progressive download completed: path=%s bytes=%s restarts=%s retries=%s",
+                target, actual, restarts, attempts,
+            )
+            return True
 
     async def threaded_download(
         self: "BaseCore",
@@ -2402,6 +3412,18 @@ class BaseCore:
             ios_support = configuration.ios_support
             timeout = timeout
             pre_resolved_m3u8_url = pre_resolved_m3u8
+            # Per-source transport headers, applied to every request this
+            # download makes (playlists and segments alike, fresh or resumed).
+            # Names only in the log - header values are not ours to print.
+            raw_source_headers = getattr(configuration.media_source, "headers", None)
+            source_headers: Dict[str, str] | None = (
+                dict(raw_source_headers) if raw_source_headers else None
+            )
+            if source_headers:
+                self.logger.debug(
+                    "Applying %d source-specific request header(s): %s",
+                    len(source_headers), sorted(source_headers),
+                )
 
             self.logger.info(
                 f"Threaded download start: quality={quality} path={path} remux={remux} start_segment={start_segment} "
@@ -2431,6 +3453,26 @@ class BaseCore:
                     self.logger.warning(f"Failed to load segment state {segment_state_path}: {e}. Starting fresh.")
                     resume_state = None
                     resume_mode = False
+
+            if resume_mode:
+                assert resume_state is not None
+                loaded_segments = resume_state.get("segments") or []
+                if (
+                    int(resume_state.get("version") or 1) < 2
+                    and loaded_segments
+                    and all(isinstance(entry, str) for entry in loaded_segments)
+                    and len(set(loaded_segments)) < len(loaded_segments)
+                ):
+                    # A version-1 state cannot express byte ranges, so duplicate
+                    # URLs in one mean it was written for a byte-range playlist
+                    # by an engine without range support. Resuming it would
+                    # fetch the full resource once per fragment - start fresh.
+                    self.logger.warning(
+                        "Segment state %s predates byte-range support and repeats URLs; discarding it and starting fresh.",
+                        segment_state_path,
+                    )
+                    resume_mode = False
+                    resume_state = None
 
             if resume_mode:
                 assert resume_state is not None
@@ -2470,8 +3512,15 @@ class BaseCore:
 
             else:
                 m3u8_master = pre_resolved_m3u8_url
-                self.logger.info(f"Fetching segments for quality={quality} m3u8_url_master={m3u8_master}")
-                segments = await self.get_segments(quality=quality, m3u8_url_master=m3u8_master)
+                self.logger.info(f"Fetching segments for quality={quality} media_source.url={m3u8_master}")
+                
+                # Mocking a source temporarily for threaded_download compatibility with get_segments
+                class _TempSource:
+                    source_type = "HLS"
+                    url = m3u8_master
+                    headers = source_headers or {}
+
+                segments = await self.get_segments(quality=quality, source=_TempSource())
                 total_before = len(segments)
                 if start_segment > 0:
                     self.logger.debug(
@@ -2489,7 +3538,42 @@ class BaseCore:
                     f"segment_index_width={width} m3u8_url={m3u8_url}"
                 )
 
-            n = len(segments) # Total amount of segments
+            # One internal representation for both worlds: plain URLs (str),
+            # parsed playlist entries (HLSSegment) and resumed state entries
+            # (JSON dicts) all become HLSSegment before anything downloads.
+            def _as_spec(entry: Any) -> HLSSegment:
+                if isinstance(entry, HLSSegment):
+                    return entry
+                if isinstance(entry, Mapping):
+                    return HLSSegment(
+                        url=str(entry.get("url", "")),
+                        length=entry.get("length"),
+                        offset=entry.get("offset"),
+                    )
+                return HLSSegment(url=str(entry))
+
+            segment_specs = [_as_spec(entry) for entry in segments]
+            ranged_mode = any(spec.has_range for spec in segment_specs)
+            # What the state file stores. Version 1 keeps the plain-string
+            # layout every existing state uses; ranged playlists persist
+            # url+range per entry and bump the version, so a range entry can
+            # never be mistaken for a URL by mistake.
+            if ranged_mode:
+                state_version = 2
+                state_segments: List[Any] = [
+                    {"url": spec.url, "length": spec.length, "offset": spec.offset}
+                    if spec.has_range else {"url": spec.url}
+                    for spec in segment_specs
+                ]
+                self.logger.info(
+                    "Byte-range playlist: %d of %d segments are sub-ranges.",
+                    sum(1 for spec in segment_specs if spec.has_range), len(segment_specs),
+                )
+            else:
+                state_version = 1
+                state_segments = [spec.url for spec in segment_specs]
+
+            n = len(segment_specs) # Total amount of segments
             if n == 0:
                 raise UnknownError("No segments found for this playlist.")
                 # Shouldn't happen
@@ -2571,18 +3655,24 @@ class BaseCore:
                     # Create a semaphore to limit concurrent requests
                     semaphore = asyncio.Semaphore(workers)
 
-                    async def fetch_segment_with_semaphore(idx: int, url: str) -> Tuple[int, bool, bytes]:
+                    async def fetch_segment_with_semaphore(idx: int, spec: HLSSegment) -> Tuple[int, bool, bytes]:
+                        url = spec.url
+                        byte_range = (spec.offset or 0, spec.length) if spec.has_range else None
                         async with semaphore:
                             if stop_event is not None and stop_event.is_set():
                                 return idx, False, b""
 
-                            # Handle retries inside the coroutine
+                            # Handle retries inside the coroutine. Every attempt
+                            # repeats the identical URL, Range and source headers.
                             for attempt in range(max_seg_retries + 1):
                                 if stop_event is not None and stop_event.is_set():
                                     return idx, False, b""
 
                                 try:
-                                    _, segment_data, is_success = await self.download_segment(url, timeout, stop_event)
+                                    _, segment_data, is_success = await self.download_segment(
+                                        url, timeout, stop_event, headers=source_headers,
+                                        byte_range=byte_range,
+                                    )
                                     if is_success and segment_data:
                                         return idx, True, segment_data
                                 except Exception as exception:
@@ -2601,16 +3691,20 @@ class BaseCore:
 
                     segment_tasks = {
                         asyncio.create_task(
-                            fetch_segment_with_semaphore(i, segments[i]),
+                            fetch_segment_with_semaphore(i, segment_specs[i]),
                             name=f"hls-segment-{i}",
                         )
                         for i in target_indices
                     }
-                    stop_waiter = (
-                        asyncio.create_task(stop_event.wait(), name="hls-stop-waiter")
-                        if stop_event is not None
-                        else None
-                    )
+                    if stop_event is not None:
+                        if hasattr(stop_event, "is_set") and not asyncio.iscoroutinefunction(getattr(stop_event, "wait", None)):
+                            # Handle threading.Event by offloading to thread
+                            stop_waiter = asyncio.create_task(asyncio.to_thread(stop_event.wait), name="hls-stop-waiter")
+                        else:
+                            # Handle asyncio.Event natively
+                            stop_waiter = asyncio.create_task(stop_event.wait(), name="hls-stop-waiter")
+                    else:
+                        stop_waiter = None
 
                     while segment_tasks:
                         waiters = set(segment_tasks)
@@ -2704,7 +3798,7 @@ class BaseCore:
                 cancelled = True
 
             missing = [i for i, ok in enumerate(downloaded) if not ok] # Missing segments
-            missing_urls = [segments[i] for i in missing] # Missing URLs of segments
+            missing_urls = [segment_specs[i].url for i in missing] # Missing URLs of segments
             self.logger.info(
                 "Segment download finished: downloaded=%s/%s missing=%s cancelled=%s",
             downloaded_count, n, len(missing), cancelled)
@@ -2741,7 +3835,8 @@ class BaseCore:
                     assert  isinstance(segment_state_path, str)
                     self.logger.info(f"Writing segment state to: {segment_state_path}")
                     state = build_segment_state(
-                        segments=segments,
+                        segments=state_segments,
+                        version=state_version,
                         missing=missing,
                         segment_dir=segment_dir,
                         segment_index_width=width if segment_dir else 0,
@@ -2769,7 +3864,8 @@ class BaseCore:
                 if segment_state_path:
                     self.logger.info(f"Writing segment state to: {segment_state_path}")
                     state = build_segment_state(
-                        segments=segments,
+                        segments=state_segments,
+                        version=state_version,
                         missing=missing,
                         segment_dir=segment_dir,
                         segment_index_width=width if segment_dir else 0,
@@ -2814,7 +3910,8 @@ class BaseCore:
                     if segment_state_path:
                         self.logger.info(f"Writing segment state to: {segment_state_path}")
                         state = build_segment_state(
-                            segments=segments,
+                            segments=state_segments,
+                            version=state_version,
                             missing=missing,
                             segment_dir=segment_dir,
                             segment_index_width=width if segment_dir else 0,
@@ -2878,6 +3975,67 @@ class BaseCore:
             self.logger.exception(f"Unhandled exception in download wrapper: {e}")
             return False
 
+    # A download that finished every segment must not be thrown away because our
+    # own process still holds the assembled file open. Windows refuses to move an
+    # open file, so closure is deterministic and the move is retried briefly.
+    _RENAME_RETRY_ATTEMPTS = 4
+    _RENAME_RETRY_INITIAL_DELAY = 0.05
+
+    @staticmethod
+    def _describe_path(path: str) -> str:
+        """Metadata about a file, never its contents."""
+        try:
+            return f"exists size={os.path.getsize(path)}"
+        except OSError:
+            return "missing"
+
+    def _replace_with_retry(self, source: str, target: str) -> None:
+        """Move `source` onto `target`, tolerating a brief sharing violation.
+
+        Every handle this process owns is closed before this runs. Windows can
+        still hold a file for a moment afterwards - a scanner, the indexer, or the
+        filesystem itself - and that window is short. Only WinError 32 is retried;
+        any other PermissionError means something is genuinely wrong and must not
+        be papered over by waiting.
+
+        os.replace rather than os.rename: rename refuses to overwrite an existing
+        target on Windows, which turns a re-download into a spurious failure.
+        """
+        delay = self._RENAME_RETRY_INITIAL_DELAY
+        for attempt in range(1, self._RENAME_RETRY_ATTEMPTS + 1):
+            try:
+                os.replace(source, target)
+                return
+            except PermissionError as error:
+                if getattr(error, "winerror", None) != 32:
+                    raise
+                if attempt >= self._RENAME_RETRY_ATTEMPTS:
+                    self.logger.error(
+                        "Final rename blocked by WinError 32 after %s attempts; giving up. tmp=[%s] target=[%s]",
+                        attempt,
+                        self._describe_path(source),
+                        self._describe_path(target),
+                    )
+                    raise
+                self.logger.warning(
+                    "Final rename blocked by WinError 32; retry %s/%s after %.0f ms",
+                    attempt + 1,
+                    self._RENAME_RETRY_ATTEMPTS,
+                    delay * 1000,
+                )
+                time.sleep(delay)
+                delay *= 2
+
+    def _close_quietly(self, container: Any, role: str) -> None:
+        if container is None:
+            return
+        try:
+            container.close()
+        except Exception as exc:
+            # Never let a failure to close replace the error we are actually
+            # reporting - but do not hide it either.
+            self.logger.debug("Closing %s container failed: %s", role, exc)
+
     def _convert_ts_to_mp4(self, input_path: str, output_path: str,
                            callback: Callable[[int, int], None] | None = None, ios_support: bool = False) -> None:
         start_ts = time.perf_counter()
@@ -2900,154 +4058,168 @@ class BaseCore:
 
         self.logger.debug("Opening input for remux: %s", input_path)
         input_ = av_open(input_path)
-        fmt_name = (input_.format.name or "").lower()
-        self.logger.info("Input format detected: %s", fmt_name or '<unknown>')
+        output = None
+        pass_through = False
 
-        if fmt_name == "mpegts":
-            # Fix 1: Suppress the stub mismatch for av.open
-            output = av_open(output_path, mode="w", format="mp4",
-                             options={"movflags": "faststart"})  # type: ignore[arg-type]
+        try:
+            fmt_name = (input_.format.name or "").lower()
+            self.logger.info("Input format detected: %s", fmt_name or '<unknown>')
 
-            # --- VIDEO ---
-            in_video = input_.streams.video[0]
-            out_video = output.add_stream_from_template(template=in_video)
-            self.logger.debug(
-                "Video stream: codec=%s bit_rate=%s",
-                getattr(in_video.codec_context, 'name', None), getattr(in_video.codec_context, 'bit_rate', None)
-            )
+            if fmt_name == "mpegts":
+                # Fix 1: Suppress the stub mismatch for av.open
+                output = av_open(output_path, mode="w", format="mp4",
+                                 options={"movflags": "faststart"})  # type: ignore[arg-type]
 
-            # --- AUDIO ---
-            in_audio = next((s for s in input_.streams if s.type == "audio"), None)
-            out_audio = None
-            transcode_audio = False
-            resampler = None
-
-            if in_audio:
-                # Fix 3: Explicitly narrow out None
-                assert in_audio is not None
-
-                # Fix 2: Cast context to AudioCodecContext so IDE knows about sample_rate and layout
-                audio_ctx = cast('AudioCodecContext', in_audio.codec_context)
-
-                copy_ok = {"aac"} if ios_support else {"aac", "alac", "mp3"}
-                codec_name = (audio_ctx.name or "").lower()
-                sample_rate = audio_ctx.sample_rate or 0
-                layout_name = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "unknown"
-
+                # --- VIDEO ---
+                in_video = input_.streams.video[0]
+                out_video = output.add_stream_from_template(template=in_video)
                 self.logger.debug(
-                    "Audio stream: codec=%s sample_rate=%s layout=%s", codec_name, sample_rate, layout_name
+                    "Video stream: codec=%s bit_rate=%s",
+                    getattr(in_video.codec_context, 'name', None), getattr(in_video.codec_context, 'bit_rate', None)
                 )
 
-                if codec_name in copy_ok:
-                    out_audio = output.add_stream_from_template(template=in_audio)
-                    self.logger.info("Audio codec MP4-compatible; remuxing without transcoding.")
-                else:
-                    transcode_audio = True
-                    sample_rate = audio_ctx.sample_rate or 48000
-                    layout = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "stereo"
+                # --- AUDIO ---
+                in_audio = next((s for s in input_.streams if s.type == "audio"), None)
+                out_audio = None
+                transcode_audio = False
+                resampler = None
 
-                    out_audio = output.add_stream("aac", rate=sample_rate)
-                    self.logger.info("Transcoding audio to AAC: sample_rate=%s layout=%s"), sample_rate, layout
+                if in_audio:
+                    # Fix 3: Explicitly narrow out None
+                    assert in_audio is not None
 
-                    try:
-                        out_audio.layout = layout
-                    except Exception as exc:
-                        self.logger.warning("Exception in getting audio layout (doesn't matter): %s", exc)
-                        pass
+                    # Fix 2: Cast context to AudioCodecContext so IDE knows about sample_rate and layout
+                    audio_ctx = cast('AudioCodecContext', in_audio.codec_context)
 
-                    resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
-            else:
-                self.logger.info("No audio stream detected; remuxing video only.")
+                    copy_ok = {"aac"} if ios_support else {"aac", "alac", "mp3"}
+                    codec_name = (audio_ctx.name or "").lower()
+                    sample_rate = audio_ctx.sample_rate or 0
+                    layout_name = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "unknown"
 
-            # --- DEMUX ---
-            demux_streams = [in_video] + ([in_audio] if in_audio else [])
-            packets = input_.demux(demux_streams)
-
-            try:
-                total = os.path.getsize(input_path)
-            except Exception as exc:
-                self.logger.warning("Exception while getting path size for demuxing progress??? %s", exc)
-                total = 100
-
-            self.logger.info("Demuxing packets: total_bytes=%s", total)
-            progress_step = max(1, total // 10) if total else 0
-            next_progress_log = progress_step if progress_step else 0
-            current_progress = 0
-            timestamp_offsets: dict[int, int] = {}
-            last_dts: dict[int, int] = {}
-            last_durations: dict[int, int] = {}
-
-            for idx, packet in enumerate(packets):
-                pkt_size = getattr(packet, "size", 0) or 0
-                current_progress += pkt_size
-
-                if packet.dts is None:
-                    if callback:
-                        callback(current_progress, total)
-                    continue
-
-                timestamp_correction = _normalize_packet_timestamps(
-                    packet,
-                    timestamp_offsets,
-                    last_dts,
-                    last_durations,
-                )
-                if timestamp_correction:
-                    self.logger.info(
-                        "Normalized HLS timestamp discontinuity: stream=%s correction=%s time_base=%s",
-                        packet.stream.index,
-                        timestamp_correction,
-                        packet.time_base,
+                    self.logger.debug(
+                        "Audio stream: codec=%s sample_rate=%s layout=%s", codec_name, sample_rate, layout_name
                     )
 
-                if packet.stream == in_video:
-                    packet.stream = out_video
-                    output.mux(packet)
-
-                elif in_audio and packet.stream == in_audio:
-                    if not transcode_audio:
-                        packet.stream = out_audio
-                        output.mux(packet)
+                    if codec_name in copy_ok:
+                        out_audio = output.add_stream_from_template(template=in_audio)
+                        self.logger.info("Audio codec MP4-compatible; remuxing without transcoding.")
                     else:
-                        assert out_audio is not None
-                        for frame in packet.decode():
-                            # Fix 4: Ensure the frame is recognized as an AudioFrame
-                            if not isinstance(frame, av.audio.frame.AudioFrame):
-                                continue
+                        transcode_audio = True
+                        sample_rate = audio_ctx.sample_rate or 48000
+                        layout = audio_ctx.layout.name if getattr(audio_ctx, "layout", None) else "stereo"
 
-                            frames = resampler.resample(frame) if resampler else [frame]
-                            for f in frames:
-                                for enc_pkt in out_audio.encode(f):
-                                    output.mux(enc_pkt)
+                        out_audio = output.add_stream("aac", rate=sample_rate)
+                        self.logger.info("Transcoding audio to AAC: sample_rate=%s layout=%s", sample_rate, layout)
 
-                if callback:
-                    callback(current_progress, total)
-                if progress_step and current_progress >= next_progress_log:
-                    self.logger.debug("Remux progress: bytes=%s/%s", current_progress, total)
-                    next_progress_log += progress_step
+                        try:
+                            out_audio.layout = layout
+                        except Exception as exc:
+                            self.logger.warning("Exception in getting audio layout (doesn't matter): %s", exc)
 
-            if transcode_audio and out_audio:
-                self.logger.debug("Flushing AAC encoder.")
-                for enc_pkt in out_audio.encode(None):
-                    output.mux(enc_pkt)
+                        resampler = AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+                else:
+                    self.logger.info("No audio stream detected; remuxing video only.")
 
-            input_.close()
-            output.close()
+                # --- DEMUX ---
+                demux_streams = [in_video] + ([in_audio] if in_audio else [])
+                packets = input_.demux(demux_streams)
+
+                try:
+                    total = os.path.getsize(input_path)
+                except Exception as exc:
+                    self.logger.warning("Exception while getting path size for demuxing progress??? %s", exc)
+                    total = 100
+
+                self.logger.info("Demuxing packets: total_bytes=%s", total)
+                progress_step = max(1, total // 10) if total else 0
+                next_progress_log = progress_step if progress_step else 0
+                current_progress = 0
+                timestamp_offsets: dict[int, int] = {}
+                last_dts: dict[int, int] = {}
+                last_durations: dict[int, int] = {}
+
+                for idx, packet in enumerate(packets):
+                    pkt_size = getattr(packet, "size", 0) or 0
+                    current_progress += pkt_size
+
+                    if packet.dts is None:
+                        if callback:
+                            callback(current_progress, total)
+                        continue
+
+                    timestamp_correction = _normalize_packet_timestamps(
+                        packet,
+                        timestamp_offsets,
+                        last_dts,
+                        last_durations,
+                    )
+                    if timestamp_correction:
+                        self.logger.info(
+                            "Normalized HLS timestamp discontinuity: stream=%s correction=%s time_base=%s",
+                            packet.stream.index,
+                            timestamp_correction,
+                            packet.time_base,
+                        )
+
+                    if packet.stream == in_video:
+                        packet.stream = out_video
+                        output.mux(packet)
+
+                    elif in_audio and packet.stream == in_audio:
+                        if not transcode_audio:
+                            packet.stream = out_audio
+                            output.mux(packet)
+                        else:
+                            assert out_audio is not None
+                            for frame in packet.decode():
+                                # Fix 4: Ensure the frame is recognized as an AudioFrame
+                                if not isinstance(frame, av.audio.frame.AudioFrame):
+                                    continue
+
+                                frames = resampler.resample(frame) if resampler else [frame]
+                                for f in frames:
+                                    for enc_pkt in out_audio.encode(f):
+                                        output.mux(enc_pkt)
+
+                    if callback:
+                        callback(current_progress, total)
+                    if progress_step and current_progress >= next_progress_log:
+                        self.logger.debug("Remux progress: bytes=%s/%s", current_progress, total)
+                        next_progress_log += progress_step
+
+                if transcode_audio and out_audio:
+                    self.logger.debug("Flushing AAC encoder.")
+                    for enc_pkt in out_audio.encode(None):
+                        output.mux(enc_pkt)
+
+            else:
+                # Already MP4 - typically fragmented-MP4 HLS. Nothing to remux, the
+                # assembled file only has to be moved into place. The move happens
+                # after the finally below, because PyAV still has this very file
+                # open right now and Windows will not move an open file.
+                self.logger.info("Stream seems to be already in MP4! Skipping remux...")
+                pass_through = True
+
+        finally:
+            # Deterministic, and in this order: the writer first, then the reader.
+            # Relying on garbage collection here is what produced WinError 32.
+            self._close_quietly(output, "output")
+            self._close_quietly(input_, "input")
+
+        if pass_through:
+            self._replace_with_retry(input_path, output_path)
             elapsed = time.perf_counter() - start_ts
+            self.logger.info("Remux skipped; file moved. elapsed=%.2fs", elapsed)
+            return
 
-            try:
-                out_size = os.path.getsize(output_path)
-                self.logger.info("Remux complete: output=%s size=%s bytes elapsed=%s.2f", output_path, out_size,
-                                 elapsed)
-            except Exception as e:
-                self.logger.info("Remux complete: output=%s elapsed=%s.2fs (size unavailable: %s)", output_path,
-                                 elapsed, e)
-
-        else:
-            self.logger.info("Stream seems to be already in MP4! Skipping remux...")
-            os.rename(input_path, output_path)
-            elapsed = time.perf_counter() - start_ts
-            self.logger.info("Remux skipped; file moved. elapsed=%s.2f", elapsed)
+        elapsed = time.perf_counter() - start_ts
+        try:
+            out_size = os.path.getsize(output_path)
+            self.logger.info("Remux complete: output=%s size=%s bytes elapsed=%.2fs", output_path, out_size,
+                             elapsed)
+        except Exception as e:
+            self.logger.info("Remux complete: output=%s elapsed=%.2fs (size unavailable: %s)", output_path,
+                             elapsed, e)
 
     async def legacy_download(self, url: str, configuration: DownloadConfigRAW) -> bool:
         """
