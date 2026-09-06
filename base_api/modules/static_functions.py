@@ -503,6 +503,7 @@ def build_progressive_state(
     etag_weak: bool,
     last_modified: str | None,
     created_at: str | None = None,
+    identity: str | None = None,
 ) -> ProgressiveDownloadState:
     now = datetime.now(timezone.utc).isoformat()
     return ProgressiveDownloadState(
@@ -510,7 +511,11 @@ def build_progressive_state(
         kind=PROGRESSIVE_STATE_KIND,
         created_at=created_at or now,
         updated_at=now,
-        url=url,
+        # With an identity to compare against, the URL is only ever read by a
+        # human looking at a stale state file, so it is stored redacted. Without
+        # one it *is* the comparison and has to be stored as given.
+        url=url if identity is None else format_url_for_log(url),
+        identity=identity,
         output_path=output_path,
         temp_path=temp_path,
         total_size=total_size,

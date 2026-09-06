@@ -3168,6 +3168,10 @@ class BaseCore:
         # One redaction for the whole download: the URL below is only ever
         # shown, never fetched, so nothing downstream needs the real query.
         logged_url = format_url_for_log(source_url)
+        # What the resume state is keyed on. The provider's own name for the
+        # track when it has one, the URL when it does not.
+        identity = getattr(media_source, "identity", None)
+        resume_key = identity or source_url
         raw_headers = getattr(media_source, "headers", None)
         source_headers: Dict[str, str] = dict(raw_headers) if raw_headers else {}
         expected_size = configuration.expected_size
@@ -3186,10 +3190,19 @@ class BaseCore:
         )
 
         state = load_progressive_state(state_path) if state_path else None
-        if state is not None and state.get("url") != source_url:
-            # A different URL means different bytes, whatever the file holds.
+        if state is not None and (state.get("identity") or state.get("url")) != resume_key:
+            # Not the resource these bytes belong to, whatever the file holds.
+            #
+            # Which key answers that depends on what the provider gave us. A URL
+            # is an honest identity only while it stays stable: a signed one
+            # expires within hours, and re-resolving the same track yields a
+            # different URL for byte-identical content, so comparing URLs throws
+            # away every resume across a restart. An identity, where a provider
+            # supplies one, says "same track" straight through that change.
+            # Where none is supplied, nothing here behaves differently.
             self.logger.info(
-                "Resume state at %s was written for another URL; starting fresh.", state_path
+                "Resume state at %s was written for another resource; starting fresh.",
+                state_path,
             )
             self._safe_remove(tmp_path)
             self._safe_remove(state_path)
@@ -3214,6 +3227,7 @@ class BaseCore:
                 return
             record = build_progressive_state(
                 url=source_url,
+                identity=identity,
                 output_path=target,
                 temp_path=tmp_path,
                 total_size=total,
