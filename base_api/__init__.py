@@ -24,6 +24,7 @@ __all__ = [
     "MediaLoadError",
     "MediaLoadErrors",
     "MediaSource",
+    "MediaTrackInfo",
     "OversizedBody",
     "PageFetchError",
     "ResultOrder",
@@ -92,7 +93,7 @@ from base_api.modules.config import (
 )
 
 from .direct_adapter import DirectMediaAdapter
-from .models import HLSSegment, MediaSource
+from .models import HLSSegment, MediaSource, MediaTrackInfo
 
 
 from .provider import MediaProvider

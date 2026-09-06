@@ -47,13 +47,30 @@ class ProgressiveDownloadState:
     are kept so the next run can decide for itself whether the remote resource
     is still the one those bytes came from - the transport never relies on the
     server evaluating `If-Range` correctly.
+
+    `identity` and `url` together answer "are these bytes still the resource we
+    are fetching now?". Whichever of the two is present decides; `identity`
+    wins when a provider supplied one. See the field notes below for why a URL
+    alone cannot answer that question for a signed source.
     """
 
     version: int
     kind: str
     created_at: Any
     updated_at: Any
+    #: The source URL when nothing else identifies the resource, and a redacted
+    #: form of it - host and path, no query values - when `identity` does. It is
+    #: a diagnostic either way: enough to see which resource a stale state file
+    #: belongs to, never enough to leak a signature into the user's download
+    #: folder.
     url: str
+    #: The provider's stable name for this track, when it has one. Present here
+    #: so a resume survives the URL changing underneath it: a signed URL expires
+    #: within hours and re-resolving the same track yields a different one, so a
+    #: state keyed on the URL discards a perfectly good partial file every time.
+    #: Absent for every provider that supplies none, in which case `url` is the
+    #: identity exactly as it always was.
+    identity: str | None
     output_path: Path | str
     temp_path: Path | str
     total_size: int | None
