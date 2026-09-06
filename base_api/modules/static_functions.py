@@ -16,6 +16,7 @@ from datetime import timezone, datetime
 from curl_cffi.requests import Response
 from typing import Dict, Any, cast, List, Callable, Literal, Union
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit, urlunsplit
 
 
 HEIGHT_FROM_URI = re.compile(r'(?<!\d)(\d{3,4})[pP](?!\d)')  # e.g., 1080p, 720P
@@ -597,6 +598,59 @@ def str_to_bool(value: str) -> bool:
     if val in ("false", "0", "no"):
         return False
     raise ValueError(f"Invalid boolean value: {value}")
+
+
+#: What a redacted query parameter shows instead of its value. ASCII on
+#: purpose: this string ends up in log files whose handlers may be writing in
+#: the console's code page, and a log line must never fail to be written.
+REDACTED_VALUE = "***"
+
+
+def format_url_for_log(url: Any) -> str:
+    """A URL with its query *values* removed, for logs, errors and state files.
+
+    Scheme, host and path stay: they are what makes a line useful - which CDN,
+    which resource - and none of them is a secret. The query is where signed
+    media URLs put the parts that are. A `googlevideo` URL carries the viewer's
+    IP, a session id, an expiry and a signature there; an S3 presigned URL
+    carries credentials. Any of those in a log file, in an error message a UI
+    shows, or in a resume state sitting in the user's download folder is a leak
+    that no amount of care further up can prevent, because it is this library
+    that writes those lines.
+
+    Parameter *names* are kept. "Which parameters were present" answers a real
+    diagnostic question - whether a range was signed, whether an expiry was
+    set - without answering "what were they".
+
+    A URL with no query is returned unchanged, which is the overwhelming
+    majority of sources: PeerTube's object storage, a plain `.m3u8`, a direct
+    MP4. Those go on logging exactly as they always have.
+    """
+    if not isinstance(url, str) or not url:
+        return "<no url>"
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        # An unparsable URL is not worth guessing at, and printing it raw is
+        # the one thing this function exists to avoid.
+        return "<unparsable url>"
+
+    if not parts.query and not parts.fragment:
+        return url
+
+    names: List[str] = []
+    for pair in parts.query.split("&"):
+        if not pair:
+            continue
+        name = pair.split("=", 1)[0]
+        if name and name not in names:
+            names.append(name)
+
+    redacted = "&".join(f"{name}={REDACTED_VALUE}" for name in names)
+    # The fragment is dropped rather than redacted: nothing in this library
+    # sends one, so its presence is noise rather than signal.
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, redacted, ""))
 
 
 def format_headers_for_log(headers: Any) -> Dict[str, str]:

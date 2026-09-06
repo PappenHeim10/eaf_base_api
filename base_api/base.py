@@ -38,7 +38,7 @@ from base_api.modules.static_functions import (
     write_segment_state, build_segment_state, segment_file_path,
     parse_challenge, other_challenge, least_factors, available_qualities,
     choose_variant, collect_variants, get_segment_index_width,
-    build_progressive_state, load_progressive_state, normalize_etag,
+    build_progressive_state, format_url_for_log, load_progressive_state, normalize_etag,
     parse_content_range, parse_unsatisfied_content_range, write_progressive_state,
 )
 from base_api.modules.config import (
@@ -2847,11 +2847,14 @@ class BaseCore:
 
             headers = self._progressive_headers(source_headers, offset, validators)
             cookies = self._merged_cookies(None)
+            # Redacted once per attempt: every message below is a place a signed
+            # URL would otherwise reach a log file or a user-visible error.
+            logged_url = format_url_for_log(current_url)
             await self.enforce_delay()
             self.total_requests += 1
             self.logger.debug(
                 "Progressive GET %s offset=%s header_names=%s",
-                current_url, offset, sorted(headers),
+                logged_url, offset, sorted(headers),
             )
 
             async with cast(Any, session).stream(
@@ -2869,21 +2872,24 @@ class BaseCore:
                     location = response.headers.get("Location")
                     if not location:
                         raise HTTPStatusError(
-                            f"HTTP {status} without a Location header for {current_url}",
+                            f"HTTP {status} without a Location header for {logged_url}",
                             status_code=status,
                             url=current_url,
                         )
                     redirects += 1
                     if redirects > self._PROGRESSIVE_MAX_REDIRECTS:
                         raise HTTPStatusError(
-                            f"More than {self._PROGRESSIVE_MAX_REDIRECTS} redirects starting at {url}",
+                            f"More than {self._PROGRESSIVE_MAX_REDIRECTS} redirects starting at "
+                            f"{format_url_for_log(url)}",
                             status_code=status,
                             url=current_url,
                         )
                     # Validated again: the previous hop's approval says nothing
                     # about where this one points.
                     current_url = self._validate_progressive_url(urljoin(current_url, location))
-                    self.logger.debug("Progressive redirect %s -> %s", status, current_url)
+                    self.logger.debug(
+                        "Progressive redirect %s -> %s", status, format_url_for_log(current_url)
+                    )
                     continue
 
                 if status == 429:
@@ -2938,13 +2944,13 @@ class BaseCore:
 
                 if status in {401, 403}:
                     raise AccessDeniedError(
-                        f"Request blocked by server (HTTP {status}) for {current_url}"
+                        f"Request blocked by server (HTTP {status}) for {logged_url}"
                     )
                 if status == 410:
-                    raise ResourceGone(f"Resource gone (HTTP 410) for URL: {current_url}")
+                    raise ResourceGone(f"Resource gone (HTTP 410) for URL: {logged_url}")
                 if status not in {200, 206}:
                     raise HTTPStatusError(
-                        f"HTTP {status} for {current_url}", status_code=status, url=current_url
+                        f"HTTP {status} for {logged_url}", status_code=status, url=logged_url
                     )
 
                 entity_tag, tag_is_weak = normalize_etag(response.headers.get("ETag"))
@@ -3021,7 +3027,7 @@ class BaseCore:
                     self.logger.warning(
                         "The provider stated %s bytes for %s but the response states %s; "
                         "the response wins for this body.",
-                        expected_size, current_url, total,
+                        expected_size, logged_url, total,
                     )
 
                 written = write_offset
@@ -3041,7 +3047,7 @@ class BaseCore:
                         written += len(piece)
                         if total is not None and written > total:
                             raise OversizedBody(
-                                f"{current_url} sent more than the {total} bytes it stated",
+                                f"{logged_url} sent more than the {total} bytes it stated",
                                 written=written,
                                 expected=int(total),
                             )
@@ -3159,6 +3165,9 @@ class BaseCore:
                 else self.configuration.request_attempts
             ),
         )
+        # One redaction for the whole download: the URL below is only ever
+        # shown, never fetched, so nothing downstream needs the real query.
+        logged_url = format_url_for_log(source_url)
         raw_headers = getattr(media_source, "headers", None)
         source_headers: Dict[str, str] = dict(raw_headers) if raw_headers else {}
         expected_size = configuration.expected_size
@@ -3309,9 +3318,9 @@ class BaseCore:
                 if attempts >= max_attempts:
                     error = last_error or NetworkRequestError(outcome.reason or "transient failure")
                     self.logger.error(
-                        "Progressive download of %s failed after %s attempts.", source_url, attempts
+                        "Progressive download of %s failed after %s attempts.", logged_url, attempts
                     )
-                    raise RequestRetriesExhausted(source_url, attempts, error)
+                    raise RequestRetriesExhausted(logged_url, attempts, error)
                 delay = (
                     outcome.retry_after
                     if outcome.retry_after is not None
@@ -3319,7 +3328,7 @@ class BaseCore:
                 )
                 self.logger.warning(
                     "Progressive attempt %s/%s for %s failed (%s); retrying in %.2fs.",
-                    attempts, max_attempts, source_url, outcome.reason, delay,
+                    attempts, max_attempts, logged_url, outcome.reason, delay,
                 )
                 if await self._sleep_unless_stopped(delay, stop_event):
                     return cancel(outcome.written, outcome.total, outcome.validators)
@@ -3332,10 +3341,10 @@ class BaseCore:
                     # contradicting itself has to surface as an error rather than
                     # re-downloading the same file forever.
                     raise ResumeConflict(
-                        f"Resuming {source_url} failed again after a fresh start: {outcome.reason}"
+                        f"Resuming {logged_url} failed again after a fresh start: {outcome.reason}"
                     )
                 restarts += 1
-                self.logger.warning("Restarting %s at byte zero: %s", source_url, outcome.reason)
+                self.logger.warning("Restarting %s at byte zero: %s", logged_url, outcome.reason)
                 self._safe_remove(tmp_path)
                 self._safe_remove(state_path)
                 offset, validators = 0, {}
@@ -3358,7 +3367,7 @@ class BaseCore:
                 # A valid prefix: keep it and its state so a later run continues.
                 persist(actual, total, outcome.validators)
                 raise IncompleteBody(
-                    f"{source_url} delivered {actual} of {total} bytes",
+                    f"{logged_url} delivered {actual} of {total} bytes",
                     written=actual,
                     expected=int(total),
                 )
@@ -3366,7 +3375,7 @@ class BaseCore:
                 self._safe_remove(tmp_path)
                 self._safe_remove(state_path)
                 raise OversizedBody(
-                    f"{source_url} delivered {actual} bytes but stated {total}",
+                    f"{logged_url} delivered {actual} bytes but stated {total}",
                     written=actual,
                     expected=int(total),
                 )
